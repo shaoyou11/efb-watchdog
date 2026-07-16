@@ -52,6 +52,21 @@ class WatchdogSettings:
         with self.lock:
             return self.state.copy()
 
+    def update(self, setting, enabled):
+        key = f"{setting}_enabled"
+        if key not in DEFAULT_SETTINGS or not isinstance(enabled, bool):
+            raise ValueError("invalid watchdog setting")
+        with self.lock:
+            self.state[key] = enabled
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = self.path.with_suffix(self.path.suffix + ".tmp")
+            temporary.write_text(
+                json.dumps(self.state, ensure_ascii=True, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            os.replace(temporary, self.path)
+            return self.state.copy()
+
 
 class FailureTracker:
     def __init__(self, limit=3):
@@ -76,22 +91,6 @@ class FailureTracker:
         self.failures = 0
         self.paused = False
         self.alerted = False
-
-    def update(self, setting, enabled):
-        key = f"{setting}_enabled"
-        if key not in DEFAULT_SETTINGS or not isinstance(enabled, bool):
-            raise ValueError("invalid watchdog setting")
-        with self.lock:
-            self.state[key] = enabled
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            temporary = self.path.with_suffix(self.path.suffix + ".tmp")
-            temporary.write_text(
-                json.dumps(self.state, ensure_ascii=True, sort_keys=True) + "\n",
-                encoding="utf-8",
-            )
-            os.replace(temporary, self.path)
-            return self.state.copy()
-
 
 def effective_event_enabled(state):
     return state["master_enabled"] and state["event_enabled"]

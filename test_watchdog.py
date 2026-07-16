@@ -67,6 +67,15 @@ class ButtonDetectionTests(unittest.TestCase):
 
 
 class RecoveryTests(unittest.TestCase):
+    def test_watchdog_setting_update_is_persisted(self):
+        with TemporaryDirectory() as directory:
+            target = Path(directory) / "settings.json"
+            settings = watchdog.WatchdogSettings(target)
+            state = settings.update("master", False)
+
+            self.assertFalse(state["master_enabled"])
+            self.assertFalse(watchdog.WatchdogSettings(target).snapshot()["master_enabled"])
+
     def test_pauses_and_alerts_once_after_three_failures(self):
         tracker = watchdog.FailureTracker(limit=3)
         self.assertFalse(tracker.record_failure())
