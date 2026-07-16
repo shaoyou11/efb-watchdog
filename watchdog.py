@@ -1,10 +1,13 @@
 import logging
+import json
 import os
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 from datetime import datetime, time as clock_time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -17,16 +20,47 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(message)s",
 )
 LOGGER = logging.getLogger("wechat-session-watchdog")
+OFFLINE_EVENT = threading.Event()
+CONTROL_CHANGED = threading.Event()
+SETTINGS = None
+DEFAULT_SETTINGS = {
+    "master_enabled": True,
+    "event_enabled": True,
+    "night_enabled": True,
+}
+
+
+class WatchdogSettings:
+    def __init__(self, path):
+        self.path = Path(path)
+        self.lock = threading.Lock()
+        self.state = DEFAULT_SETTINGS.copy()
+        self._load()
+
+    def _load(self):
+        try:
+            stored = json.loads(self.path.read_text(encoding="utf-8"))
+            for key in DEFAULT_SETTINGS:
+                if isinstance(stored.get(key), bool):
+                    self.state[key] = stored[key]
+        except FileNotFoundError:
+            return
+        except (OSError, ValueError) as error:
+            LOGGER.warning("failed to load watchdog settings: %s", error)
+
+    def snapshot(self):
+        with self.lock:
+            return self.state.copy()
 
 
 class FailureTracker:
-    def __init__(self, limit: int = 3):
+    def __init__(self, limit=3):
         self.limit = limit
         self.failures = 0
         self.paused = False
         self.alerted = False
 
-    def record_failure(self) -> bool:
+    def record_failure(self):
         if self.paused:
             return False
         self.failures += 1
@@ -38,10 +72,33 @@ class FailureTracker:
         self.alerted = True
         return True
 
-    def reset(self) -> None:
+    def reset(self):
         self.failures = 0
         self.paused = False
         self.alerted = False
+
+    def update(self, setting, enabled):
+        key = f"{setting}_enabled"
+        if key not in DEFAULT_SETTINGS or not isinstance(enabled, bool):
+            raise ValueError("invalid watchdog setting")
+        with self.lock:
+            self.state[key] = enabled
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = self.path.with_suffix(self.path.suffix + ".tmp")
+            temporary.write_text(
+                json.dumps(self.state, ensure_ascii=True, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            os.replace(temporary, self.path)
+            return self.state.copy()
+
+
+def effective_event_enabled(state):
+    return state["master_enabled"] and state["event_enabled"]
+
+
+def effective_night_enabled(state):
+    return state["master_enabled"] and state["night_enabled"]
 
 
 def parse_clock(value: str) -> clock_time:
@@ -87,6 +144,73 @@ def click_cooldown_seconds() -> int:
     return int(os.getenv("CLICK_COOLDOWN_SECONDS", "120"))
 
 
+def consume_offline_trigger() -> bool:
+    if not OFFLINE_EVENT.is_set():
+        return False
+    OFFLINE_EVENT.clear()
+    LOGGER.info("offline event received from EFB")
+    return True
+
+
+def check_due(
+    triggered,
+    schedule_is_active,
+    recovery_active,
+    seconds_since_check,
+    poll_seconds,
+):
+    return triggered or (
+        (schedule_is_active or recovery_active)
+        and seconds_since_check >= poll_seconds
+    )
+
+
+class TriggerHandler(BaseHTTPRequestHandler):
+    def _send_json(self, status, content):
+        body = json.dumps(content, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        if self.path != "/status":
+            self.send_error(404)
+            return
+        self._send_json(200, SETTINGS.snapshot())
+
+    def do_POST(self):
+        if self.path == "/offline":
+            OFFLINE_EVENT.set()
+            self.send_response(204)
+            self.end_headers()
+            return
+        if self.path != "/control":
+            self.send_error(404)
+            return
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            payload = json.loads(self.rfile.read(length) or b"{}")
+            state = SETTINGS.update(payload.get("setting"), payload.get("enabled"))
+        except (ValueError, OSError, json.JSONDecodeError):
+            self._send_json(400, {"error": "invalid request"})
+            return
+        CONTROL_CHANGED.set()
+        self._send_json(200, state)
+
+    def log_message(self, _format, *_args):
+        return
+
+
+def start_trigger_server():
+    port = int(os.getenv("TRIGGER_PORT", "18989"))
+    server = ThreadingHTTPServer(("127.0.0.1", port), TriggerHandler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    LOGGER.info("local trigger server started on 127.0.0.1:%s", port)
+    return server
+
+
 def diagnostic_path() -> Path:
     return Path(os.getenv("DIAGNOSTIC_PATH", "/diagnostics/last-login-failure.png"))
 
@@ -102,13 +226,13 @@ def clear_diagnostic() -> None:
     diagnostic_path().unlink(missing_ok=True)
 
 
-def touch_heartbeat() -> None:
+def touch_heartbeat():
     heartbeat = Path(os.getenv("HEARTBEAT_PATH", "/tmp/watchdog-heartbeat"))
     heartbeat.parent.mkdir(parents=True, exist_ok=True)
     heartbeat.touch()
 
 
-def send_alert(message: str) -> None:
+def send_alert(message):
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     chat_id = os.getenv("TELEGRAM_CHAT_ID")
     if not token or not chat_id:
@@ -216,24 +340,39 @@ def capture_and_click() -> bool:
 
 
 def main():
+    global SETTINGS
     timezone = ZoneInfo(os.getenv("TZ", "Asia/Shanghai"))
     poll_seconds = int(os.getenv("POLL_SECONDS", "120"))
     cooldown_seconds = click_cooldown_seconds()
     last_check = 0.0
     last_attempt = 0.0
+    recovery_source = None
     tracker = FailureTracker(int(os.getenv("MAX_RECOVERY_FAILURES", "3")))
 
+    SETTINGS = WatchdogSettings(os.getenv("STATE_PATH", "/state/settings.json"))
+    start_trigger_server()
     LOGGER.info("watchdog started")
     while True:
         touch_heartbeat()
         now = datetime.now(timezone)
-        if not schedule_active(now):
-            time.sleep(20)
-            continue
-
         monotonic_now = time.monotonic()
-        if monotonic_now - last_check < poll_seconds:
-            time.sleep(5)
+        state = SETTINGS.snapshot()
+        event_enabled = effective_event_enabled(state)
+        night_enabled = effective_night_enabled(state)
+        triggered = consume_offline_trigger() and event_enabled
+        scheduled = schedule_active(now) and night_enabled
+        if recovery_source == "event" and not event_enabled:
+            recovery_source = None
+        if recovery_source == "night" and not night_enabled:
+            recovery_source = None
+        if not check_due(
+            triggered,
+            scheduled,
+            recovery_source is not None,
+            monotonic_now - last_check,
+            poll_seconds,
+        ):
+            OFFLINE_EVENT.wait(timeout=5)
             continue
         last_check = monotonic_now
 
@@ -241,11 +380,14 @@ def main():
             if is_logged_in():
                 LOGGER.info("wechat is logged in")
                 last_attempt = 0.0
+                recovery_source = None
                 tracker.reset()
                 clear_diagnostic()
                 continue
 
             LOGGER.warning("wechat is offline")
+            if recovery_source is None:
+                recovery_source = "event" if triggered else "night"
             if tracker.paused:
                 LOGGER.warning("automatic clicks paused after repeated failures")
                 continue

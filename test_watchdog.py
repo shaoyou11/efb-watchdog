@@ -11,6 +11,21 @@ import watchdog
 
 
 class ScheduleTests(unittest.TestCase):
+    def test_efb_event_is_processed_outside_daily_window(self):
+        self.assertTrue(watchdog.check_due(True, False, False, 0, 120))
+
+    def test_event_recovery_retries_outside_daily_window(self):
+        self.assertTrue(watchdog.check_due(False, False, True, 120, 120))
+
+    def test_periodic_poll_is_blocked_outside_daily_window(self):
+        self.assertFalse(watchdog.check_due(False, False, False, 120, 120))
+
+    def test_consumes_offline_trigger_once(self):
+        watchdog.OFFLINE_EVENT.set()
+
+        self.assertTrue(watchdog.consume_offline_trigger())
+        self.assertFalse(watchdog.consume_offline_trigger())
+
     def test_default_click_cooldown_matches_poll_interval(self):
         with patch.dict(os.environ, {}, clear=True):
             self.assertEqual(watchdog.click_cooldown_seconds(), 120)
@@ -54,7 +69,6 @@ class ButtonDetectionTests(unittest.TestCase):
 class RecoveryTests(unittest.TestCase):
     def test_pauses_and_alerts_once_after_three_failures(self):
         tracker = watchdog.FailureTracker(limit=3)
-
         self.assertFalse(tracker.record_failure())
         self.assertFalse(tracker.record_failure())
         self.assertTrue(tracker.record_failure())
@@ -65,9 +79,7 @@ class RecoveryTests(unittest.TestCase):
         tracker = watchdog.FailureTracker(limit=3)
         tracker.record_failure()
         tracker.record_failure()
-
         tracker.reset()
-
         self.assertEqual(tracker.failures, 0)
         self.assertFalse(tracker.paused)
 
@@ -81,7 +93,6 @@ class RecoveryTests(unittest.TestCase):
         }
         with patch.dict(os.environ, environment, clear=True):
             watchdog.send_alert("恢复失败")
-
         self.assertEqual(post.call_count, 1)
         self.assertNotIn("secret", post.call_args.kwargs["json"]["text"])
 
@@ -90,7 +101,6 @@ class RecoveryTests(unittest.TestCase):
             target = Path(directory) / "heartbeat"
             with patch.dict(os.environ, {"HEARTBEAT_PATH": str(target)}, clear=True):
                 watchdog.touch_heartbeat()
-
             self.assertTrue(target.exists())
 
 
