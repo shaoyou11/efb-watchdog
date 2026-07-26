@@ -1,4 +1,5 @@
 import os
+import tempfile
 import unittest
 from datetime import datetime
 from pathlib import Path
@@ -19,6 +20,23 @@ class ScheduleTests(unittest.TestCase):
 
     def test_periodic_poll_is_blocked_outside_daily_window(self):
         self.assertFalse(watchdog.check_due(False, False, False, 120, 120))
+
+    def test_event_recovery_supersedes_night_recovery(self):
+        self.assertEqual(
+            watchdog.select_recovery_source("night", triggered=True, scheduled=True),
+            "event",
+        )
+
+    def test_night_recovery_stops_when_daily_window_ends(self):
+        self.assertIsNone(
+            watchdog.select_recovery_source("night", triggered=False, scheduled=False)
+        )
+
+    def test_event_recovery_continues_outside_daily_window(self):
+        self.assertEqual(
+            watchdog.select_recovery_source("event", triggered=False, scheduled=False),
+            "event",
+        )
 
     def test_consumes_offline_trigger_once(self):
         watchdog.OFFLINE_EVENT.set()
@@ -46,6 +64,39 @@ class ScheduleTests(unittest.TestCase):
             self.assertFalse(watchdog.schedule_active(datetime(2026, 7, 13, 23, 0)))
 
 
+class SettingsTests(unittest.TestCase):
+    def test_defaults_enable_all_switches(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings = watchdog.WatchdogSettings(os.path.join(directory, "settings.json"))
+
+        self.assertEqual(
+            settings.snapshot(),
+            {"master_enabled": True, "event_enabled": True, "night_enabled": True},
+        )
+
+    def test_switches_are_persisted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "settings.json")
+            settings = watchdog.WatchdogSettings(path)
+            settings.update("event", False)
+
+            restored = watchdog.WatchdogSettings(path)
+
+        self.assertFalse(restored.snapshot()["event_enabled"])
+
+    def test_master_switch_blocks_all_checks(self):
+        state = {"master_enabled": False, "event_enabled": True, "night_enabled": True}
+
+        self.assertFalse(watchdog.effective_event_enabled(state))
+        self.assertFalse(watchdog.effective_night_enabled(state))
+
+    def test_independent_switches_apply_when_master_is_on(self):
+        state = {"master_enabled": True, "event_enabled": False, "night_enabled": True}
+
+        self.assertFalse(watchdog.effective_event_enabled(state))
+        self.assertTrue(watchdog.effective_night_enabled(state))
+
+
 class ButtonDetectionTests(unittest.TestCase):
     def test_detects_confirmation_button(self):
         image = Image.new("RGB", (520, 380), "black")
@@ -67,15 +118,6 @@ class ButtonDetectionTests(unittest.TestCase):
 
 
 class RecoveryTests(unittest.TestCase):
-    def test_watchdog_setting_update_is_persisted(self):
-        with TemporaryDirectory() as directory:
-            target = Path(directory) / "settings.json"
-            settings = watchdog.WatchdogSettings(target)
-            state = settings.update("master", False)
-
-            self.assertFalse(state["master_enabled"])
-            self.assertFalse(watchdog.WatchdogSettings(target).snapshot()["master_enabled"])
-
     def test_pauses_and_alerts_once_after_three_failures(self):
         tracker = watchdog.FailureTracker(limit=3)
         self.assertFalse(tracker.record_failure())
@@ -91,6 +133,47 @@ class RecoveryTests(unittest.TestCase):
         tracker.reset()
         self.assertEqual(tracker.failures, 0)
         self.assertFalse(tracker.paused)
+
+    def test_new_event_rearms_paused_event_recovery(self):
+        tracker = watchdog.FailureTracker(limit=1)
+        tracker.record_failure()
+
+        self.assertTrue(watchdog.rearm_for_new_event(tracker, triggered=True))
+        self.assertEqual(tracker.failures, 0)
+        self.assertFalse(tracker.paused)
+
+    def test_periodic_retry_does_not_rearm_paused_event_recovery(self):
+        tracker = watchdog.FailureTracker(limit=1)
+        tracker.record_failure()
+
+        self.assertFalse(watchdog.rearm_for_new_event(tracker, triggered=False))
+        self.assertTrue(tracker.paused)
+
+    def test_new_night_window_rearms_paused_night_recovery(self):
+        tracker = watchdog.FailureTracker(limit=1)
+        tracker.record_failure()
+
+        self.assertTrue(
+            watchdog.rearm_for_new_night_window(
+                tracker,
+                scheduled=True,
+                was_scheduled=False,
+            )
+        )
+        self.assertFalse(tracker.paused)
+
+    def test_same_night_window_does_not_rearm_paused_recovery(self):
+        tracker = watchdog.FailureTracker(limit=1)
+        tracker.record_failure()
+
+        self.assertFalse(
+            watchdog.rearm_for_new_night_window(
+                tracker,
+                scheduled=True,
+                was_scheduled=True,
+            )
+        )
+        self.assertTrue(tracker.paused)
 
     @patch("watchdog.requests.post")
     def test_sends_alert_through_local_bot_api(self, post):

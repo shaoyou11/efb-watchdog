@@ -28,6 +28,10 @@ DEFAULT_SETTINGS = {
     "event_enabled": True,
     "night_enabled": True,
 }
+RECOVERY_LABELS = {
+    "event": "全天事件",
+    "night": "凌晨自主检测",
+}
 
 
 class WatchdogSettings:
@@ -91,6 +95,21 @@ class FailureTracker:
         self.failures = 0
         self.paused = False
         self.alerted = False
+
+
+def rearm_for_new_event(tracker, triggered):
+    if not triggered or not tracker.paused:
+        return False
+    tracker.reset()
+    return True
+
+
+def rearm_for_new_night_window(tracker, scheduled, was_scheduled):
+    if not scheduled or was_scheduled or not tracker.paused:
+        return False
+    tracker.reset()
+    return True
+
 
 def effective_event_enabled(state):
     return state["master_enabled"] and state["event_enabled"]
@@ -162,6 +181,16 @@ def check_due(
         (schedule_is_active or recovery_active)
         and seconds_since_check >= poll_seconds
     )
+
+
+def select_recovery_source(current_source, triggered, scheduled):
+    if triggered:
+        return "event"
+    if current_source == "event":
+        return "event"
+    if scheduled:
+        return "night"
+    return None
 
 
 class TriggerHandler(BaseHTTPRequestHandler):
@@ -254,6 +283,17 @@ def find_confirmation_button(image: Image.Image):
     return find_green_button(image, 45, 110, 20, 50, 0.55, 0.85)
 
 
+def select_click_target(image: Image.Image, allow_confirmation=True):
+    if allow_confirmation:
+        confirmation = find_confirmation_button(image)
+        if confirmation:
+            return "confirmation", confirmation
+    enter = find_enter_button(image)
+    if enter:
+        return "enter", enter
+    return None
+
+
 def find_green_button(image, min_width, max_width, min_height, max_height, min_y, max_y):
     rgb = image.convert("RGB")
     rows = []
@@ -310,23 +350,24 @@ def vnc_command(*args):
     subprocess.run(command, check=True, timeout=30)
 
 
-def capture_and_click() -> bool:
+def capture_and_click(allow_confirmation=True) -> bool:
     screenshot = Path(tempfile.gettempdir()) / "wechat-watchdog.png"
     try:
         vnc_command("capture", screenshot)
         with Image.open(screenshot) as image:
-            confirmation = find_confirmation_button(image)
-            enter = find_enter_button(image)
+            target = select_click_target(image, allow_confirmation)
 
-        if confirmation:
+        if target and target[0] == "confirmation":
+            confirmation = target[1]
             LOGGER.info("confirmation button detected, clicking once")
             vnc_command("move", confirmation[0], confirmation[1], "click", 1)
             time.sleep(3)
             vnc_command("capture", screenshot)
             with Image.open(screenshot) as image:
-                enter = find_enter_button(image)
+                target = select_click_target(image, allow_confirmation=False)
 
-        if enter:
+        if target and target[0] == "enter":
+            enter = target[1]
             LOGGER.info("enter button detected, clicking once")
             vnc_command("move", enter[0], enter[1], "click", 1)
             return True
@@ -346,7 +387,12 @@ def main():
     last_check = 0.0
     last_attempt = 0.0
     recovery_source = None
-    tracker = FailureTracker(int(os.getenv("MAX_RECOVERY_FAILURES", "3")))
+    was_scheduled = False
+    failure_limit = int(os.getenv("MAX_RECOVERY_FAILURES", "3"))
+    trackers = {
+        "event": FailureTracker(failure_limit),
+        "night": FailureTracker(failure_limit),
+    }
 
     SETTINGS = WatchdogSettings(os.getenv("STATE_PATH", "/state/settings.json"))
     start_trigger_server()
@@ -360,10 +406,22 @@ def main():
         night_enabled = effective_night_enabled(state)
         triggered = consume_offline_trigger() and event_enabled
         scheduled = schedule_active(now) and night_enabled
+        if rearm_for_new_night_window(
+            trackers["night"],
+            scheduled,
+            was_scheduled,
+        ):
+            LOGGER.info("new night window rearmed night recovery")
+        was_scheduled = scheduled
         if recovery_source == "event" and not event_enabled:
             recovery_source = None
         if recovery_source == "night" and not night_enabled:
             recovery_source = None
+        recovery_source = select_recovery_source(
+            recovery_source,
+            triggered,
+            scheduled,
+        )
         if not check_due(
             triggered,
             scheduled,
@@ -380,15 +438,25 @@ def main():
                 LOGGER.info("wechat is logged in")
                 last_attempt = 0.0
                 recovery_source = None
-                tracker.reset()
+                for tracker in trackers.values():
+                    tracker.reset()
                 clear_diagnostic()
                 continue
 
             LOGGER.warning("wechat is offline")
-            if recovery_source is None:
-                recovery_source = "event" if triggered else "night"
+            tracker = trackers[recovery_source]
+            if (
+                recovery_source == "event"
+                and rearm_for_new_event(tracker, triggered)
+            ):
+                LOGGER.info(
+                    "new offline event rearmed the full event recovery flow"
+                )
             if tracker.paused:
-                LOGGER.warning("automatic clicks paused after repeated failures")
+                LOGGER.warning(
+                    "%s recovery clicks paused after repeated failures",
+                    recovery_source,
+                )
                 continue
             if last_attempt and monotonic_now - last_attempt < cooldown_seconds:
                 LOGGER.info("click attempt is cooling down")
@@ -400,14 +468,20 @@ def main():
                 restored = is_logged_in()
                 LOGGER.info("login restored=%s", restored)
                 if restored:
-                    tracker.reset()
+                    for item in trackers.values():
+                        item.reset()
+                    recovery_source = None
                     clear_diagnostic()
                 else:
                     vnc_command("capture", diagnostic_path())
                     LOGGER.info("latest failed-login diagnostic saved")
-            if not restored and tracker.record_failure():
+            if (
+                not restored
+                and tracker.record_failure()
+            ):
                 send_alert(
-                    "EFB 微信自动恢复连续失败 3 次，已暂停自动点击。"
+                    f"EFB 微信{RECOVERY_LABELS[recovery_source]}恢复连续失败 3 次，"
+                    "已暂停本类自动点击。"
                     "请查看 watchdog 最新诊断画面并人工确认登录状态。"
                 )
         except Exception as error:
