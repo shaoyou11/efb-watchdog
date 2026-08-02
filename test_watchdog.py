@@ -1,3 +1,4 @@
+import json
 import os
 import tempfile
 import unittest
@@ -194,6 +195,22 @@ class RecoveryTests(unittest.TestCase):
             with patch.dict(os.environ, {"HEARTBEAT_PATH": str(target)}, clear=True):
                 watchdog.touch_heartbeat()
             self.assertTrue(target.exists())
+
+    def test_recovery_success_marker_is_written(self):
+        with TemporaryDirectory() as directory:
+            target = Path(directory) / "recovery.json"
+            with patch.dict(
+                os.environ,
+                {"RECOVERY_SUCCESS_PATH": str(target)},
+                clear=True,
+            ):
+                watchdog.mark_recovery_success("event")
+
+            payload = json.loads(target.read_text(encoding="utf-8"))
+            self.assertEqual(payload["version"], 1)
+            self.assertEqual(payload["source"], "event")
+            self.assertIsInstance(payload["created_at"], float)
+            self.assertFalse(target.with_suffix(target.suffix + ".tmp").exists())
 
 
 if __name__ == "__main__":

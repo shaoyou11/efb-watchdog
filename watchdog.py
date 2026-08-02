@@ -254,6 +254,40 @@ def clear_diagnostic() -> None:
     diagnostic_path().unlink(missing_ok=True)
 
 
+def recovery_success_path() -> Path:
+    return Path(
+        os.getenv(
+            "RECOVERY_SUCCESS_PATH",
+            "/state/auto-recovery-success.json",
+        )
+    )
+
+
+def mark_recovery_success(source: str) -> None:
+    target = recovery_success_path()
+    temporary = target.with_suffix(target.suffix + ".tmp")
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temporary.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "source": source,
+                    "created_at": time.time(),
+                },
+                ensure_ascii=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temporary, target)
+        LOGGER.info("recovery success marker written: %s", source)
+    except OSError as error:
+        LOGGER.warning("failed to write recovery success marker: %s", error)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def touch_heartbeat():
     heartbeat = Path(os.getenv("HEARTBEAT_PATH", "/tmp/watchdog-heartbeat"))
     heartbeat.parent.mkdir(parents=True, exist_ok=True)
@@ -468,8 +502,10 @@ def main():
                 restored = is_logged_in()
                 LOGGER.info("login restored=%s", restored)
                 if restored:
+                    recovered_source = recovery_source
                     for item in trackers.values():
                         item.reset()
+                    mark_recovery_success(recovered_source)
                     recovery_source = None
                     clear_diagnostic()
                 else:
