@@ -162,6 +162,32 @@ def click_cooldown_seconds() -> int:
     return int(os.getenv("CLICK_COOLDOWN_SECONDS", "120"))
 
 
+def _env_int(name: str, default: int) -> int:
+    try:
+        return max(1, int(os.getenv(name, str(default))))
+    except (TypeError, ValueError):
+        return default
+
+
+def watchdog_runtime_config() -> dict:
+    return {
+        "daily_start": os.getenv("DAILY_START", "02:50"),
+        "daily_end": os.getenv("DAILY_END", "03:50"),
+        "poll_seconds": _env_int("POLL_SECONDS", 120),
+        "click_cooldown_seconds": _env_int("CLICK_COOLDOWN_SECONDS", 120),
+        "max_recovery_failures": _env_int("MAX_RECOVERY_FAILURES", 3),
+        "timezone": os.getenv("TZ", "Asia/Shanghai"),
+        "diagnostic_retention": "仅保留最新一张",
+    }
+
+
+def status_snapshot(settings=None) -> dict:
+    source = settings or SETTINGS
+    state = source.snapshot() if source is not None else DEFAULT_SETTINGS.copy()
+    state.update(watchdog_runtime_config())
+    return state
+
+
 def consume_offline_trigger() -> bool:
     if not OFFLINE_EVENT.is_set():
         return False
@@ -206,7 +232,7 @@ class TriggerHandler(BaseHTTPRequestHandler):
         if self.path != "/status":
             self.send_error(404)
             return
-        self._send_json(200, SETTINGS.snapshot())
+        self._send_json(200, status_snapshot())
 
     def do_POST(self):
         if self.path == "/offline":

@@ -97,6 +97,28 @@ class SettingsTests(unittest.TestCase):
         self.assertFalse(watchdog.effective_event_enabled(state))
         self.assertTrue(watchdog.effective_night_enabled(state))
 
+    def test_status_snapshot_includes_recovery_runtime_configuration(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings = watchdog.WatchdogSettings(os.path.join(directory, "settings.json"))
+            environment = {
+                "DAILY_START": "02:50",
+                "DAILY_END": "03:50",
+                "POLL_SECONDS": "120",
+                "CLICK_COOLDOWN_SECONDS": "120",
+                "MAX_RECOVERY_FAILURES": "3",
+                "TZ": "Asia/Shanghai",
+            }
+            with patch.dict(os.environ, environment, clear=True):
+                state = watchdog.status_snapshot(settings)
+
+        self.assertTrue(state["master_enabled"])
+        self.assertEqual(state["daily_start"], "02:50")
+        self.assertEqual(state["daily_end"], "03:50")
+        self.assertEqual(state["poll_seconds"], 120)
+        self.assertEqual(state["click_cooldown_seconds"], 120)
+        self.assertEqual(state["max_recovery_failures"], 3)
+        self.assertEqual(state["timezone"], "Asia/Shanghai")
+
 
 class ButtonDetectionTests(unittest.TestCase):
     def test_detects_confirmation_button(self):
