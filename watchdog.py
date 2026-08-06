@@ -185,6 +185,7 @@ def status_snapshot(settings=None) -> dict:
     source = settings or SETTINGS
     state = source.snapshot() if source is not None else DEFAULT_SETTINGS.copy()
     state.update(watchdog_runtime_config())
+    state["login_event"] = login_event_snapshot()
     return state
 
 
@@ -314,33 +315,125 @@ def mark_recovery_success(source: str) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def login_state_path() -> Path:
+    return Path(os.getenv("LOGIN_STATE_PATH", "/state/login-state.json"))
+
+
+def mark_login_event(source: str) -> None:
+    target = login_state_path()
+    temporary = target.with_suffix(target.suffix + ".tmp")
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temporary.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "state": "logged_in",
+                    "source": source,
+                    "created_at": time.time(),
+                },
+                ensure_ascii=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temporary, target)
+        LOGGER.info("login event marker written: %s", source)
+    except OSError as error:
+        LOGGER.warning("failed to write login event marker: %s", error)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def login_event_snapshot() -> dict:
+    try:
+        value = json.loads(login_state_path().read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else {}
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return {}
+
+
+class LoginEventTracker:
+    """Debounce login transitions so probes do not repeat success alerts."""
+
+    VALID_STATES = {
+        "offline",
+        "qr_present",
+        "confirmation_present",
+        "enter_present",
+        "clicking",
+        "logged_in",
+        "unknown",
+    }
+
+    def __init__(self):
+        self.state = "unknown"
+        self.last_success_at = None
+        self.last_success_kind = None
+
+    def observe(self, state: str, now: float) -> bool:
+        state = state if state in self.VALID_STATES else "unknown"
+        previous = self.state
+        self.state = state
+        if state == "logged_in" and previous != "logged_in":
+            self.last_success_at = float(now)
+            self.last_success_kind = "observed"
+            return True
+        return False
+
+    def _success(self, kind: str, now: float) -> bool:
+        if self.state == "logged_in":
+            return False
+        self.state = "logged_in"
+        self.last_success_at = float(now)
+        self.last_success_kind = kind
+        return True
+
+    def manual_success(self, now: float) -> bool:
+        return self._success("manual", now)
+
+    def automatic_success(self, now: float) -> bool:
+        return self._success("automatic", now)
+
+
 def touch_heartbeat():
     heartbeat = Path(os.getenv("HEARTBEAT_PATH", "/tmp/watchdog-heartbeat"))
     heartbeat.parent.mkdir(parents=True, exist_ok=True)
     heartbeat.touch()
 
 
-def send_alert(message):
+def _send_telegram_notice(message, reply_markup=None):
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     chat_id = os.getenv("TELEGRAM_CHAT_ID")
     if not token or not chat_id:
         LOGGER.warning("telegram alert skipped: credentials are not configured")
         return
     api = os.getenv("TELEGRAM_BOT_API", "http://127.0.0.1:8081").rstrip("/")
+    payload = {"chat_id": chat_id, "text": message}
+    if reply_markup is not None:
+        payload["reply_markup"] = reply_markup
     response = requests.post(
         f"{api}/bot{token}/sendMessage",
-        json={
-            "chat_id": chat_id,
-            "text": message,
-            "reply_markup": {
-                "inline_keyboard": [[
-                    {"text": "查看失败诊断", "callback_data": "ops:diagnostic"}
-                ]]
-            },
-        },
+        json=payload,
         timeout=10,
     )
     response.raise_for_status()
+
+
+def send_alert(message):
+    _send_telegram_notice(
+        message,
+        reply_markup={
+            "inline_keyboard": [[
+                {"text": "查看失败诊断", "callback_data": "ops:diagnostic"}
+            ]]
+        },
+    )
+
+
+def send_login_success(source: str):
+    labels = {"manual": "手动登录", "automatic": "自动恢复"}
+    _send_telegram_notice(f"EFB 微信登录成功（{labels.get(source, source)}）")
 
 
 def find_enter_button(image: Image.Image):
@@ -430,9 +523,14 @@ def capture_and_click(allow_confirmation=True) -> bool:
             LOGGER.info("confirmation button detected, clicking once")
             vnc_command("move", confirmation[0], confirmation[1], "click", 1)
             time.sleep(3)
-            vnc_command("capture", screenshot)
-            with Image.open(screenshot) as image:
-                target = select_click_target(image, allow_confirmation=False)
+            for attempt in range(3):
+                vnc_command("capture", screenshot)
+                with Image.open(screenshot) as image:
+                    target = select_click_target(image, allow_confirmation=False)
+                if target:
+                    break
+                if attempt < 2:
+                    time.sleep(1)
 
         if target and target[0] == "enter":
             enter = target[1]
@@ -457,6 +555,8 @@ def main():
     recovery_source = None
     was_scheduled = False
     failure_limit = int(os.getenv("MAX_RECOVERY_FAILURES", "3"))
+    login_tracker = LoginEventTracker()
+    login_probe_initialized = False
     trackers = {
         "event": FailureTracker(failure_limit),
         "night": FailureTracker(failure_limit),
@@ -502,15 +602,24 @@ def main():
         last_check = monotonic_now
 
         try:
-            if is_logged_in():
+            logged_in = is_logged_in()
+            if logged_in:
                 LOGGER.info("wechat is logged in")
                 last_attempt = 0.0
+                if not login_probe_initialized:
+                    login_tracker.state = "logged_in"
+                    login_probe_initialized = True
+                elif login_tracker.observe("logged_in", time.time()):
+                    mark_login_event("manual")
+                    send_login_success("manual")
                 recovery_source = None
                 for tracker in trackers.values():
                     tracker.reset()
                 clear_diagnostic()
                 continue
 
+            login_probe_initialized = True
+            login_tracker.observe("offline", time.time())
             LOGGER.warning("wechat is offline")
             tracker = trackers[recovery_source]
             if (
@@ -537,6 +646,9 @@ def main():
                 LOGGER.info("login restored=%s", restored)
                 if restored:
                     recovered_source = recovery_source
+                    if login_tracker.automatic_success(time.time()):
+                        mark_login_event("automatic")
+                        send_login_success("automatic")
                     for item in trackers.values():
                         item.reset()
                     mark_recovery_success(recovered_source)

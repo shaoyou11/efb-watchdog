@@ -141,6 +141,16 @@ class ButtonDetectionTests(unittest.TestCase):
 
 
 class RecoveryTests(unittest.TestCase):
+    def test_manual_and_automatic_success_events_are_not_duplicated(self):
+        tracker = watchdog.LoginEventTracker()
+
+        self.assertTrue(tracker.observe("logged_in", 100.0))
+        self.assertFalse(tracker.observe("logged_in", 101.0))
+        self.assertFalse(tracker.manual_success(102.0))
+        tracker.observe("offline", 103.0)
+        self.assertTrue(tracker.manual_success(104.0))
+        self.assertFalse(tracker.manual_success(105.0))
+
     def test_pauses_and_alerts_once_after_three_failures(self):
         tracker = watchdog.FailureTracker(limit=3)
         self.assertFalse(tracker.record_failure())
@@ -237,6 +247,29 @@ class RecoveryTests(unittest.TestCase):
             self.assertEqual(payload["source"], "event")
             self.assertIsInstance(payload["created_at"], float)
             self.assertFalse(target.with_suffix(target.suffix + ".tmp").exists())
+
+    @patch("watchdog.requests.post")
+    def test_login_success_notification_is_separate_and_deduplicated_by_tracker(self, post):
+        post.return_value = Mock(raise_for_status=Mock())
+        environment = {
+            "TELEGRAM_BOT_TOKEN": "token-for-test",
+            "TELEGRAM_CHAT_ID": "123",
+            "TELEGRAM_BOT_API": "http://127.0.0.1:8081",
+        }
+        with patch.dict(os.environ, environment, clear=True):
+            watchdog.send_login_success("manual")
+        self.assertEqual(post.call_count, 1)
+        self.assertIn("登录成功", post.call_args.kwargs["json"]["text"])
+        self.assertNotIn("diagnostic", post.call_args.kwargs["json"])
+
+    def test_login_state_marker_is_persisted(self):
+        with TemporaryDirectory() as directory:
+            target = Path(directory) / "login-state.json"
+            with patch.dict(os.environ, {"LOGIN_STATE_PATH": str(target)}, clear=True):
+                watchdog.mark_login_event("manual")
+            payload = json.loads(target.read_text(encoding="utf-8"))
+        self.assertEqual(payload["source"], "manual")
+        self.assertEqual(payload["state"], "logged_in")
 
 
 if __name__ == "__main__":
