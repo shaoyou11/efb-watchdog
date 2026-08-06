@@ -210,6 +210,10 @@ class RecoveryTests(unittest.TestCase):
             watchdog.send_alert("恢复失败")
         self.assertEqual(post.call_count, 1)
         self.assertNotIn("secret", post.call_args.kwargs["json"]["text"])
+        self.assertEqual(
+            post.call_args.kwargs["json"]["reply_markup"]["inline_keyboard"][0][0]["callback_data"],
+            "ops:diagnostic",
+        )
 
     def test_heartbeat_file_is_updated(self):
         with TemporaryDirectory() as directory:

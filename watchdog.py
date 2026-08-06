@@ -329,7 +329,15 @@ def send_alert(message):
     api = os.getenv("TELEGRAM_BOT_API", "http://127.0.0.1:8081").rstrip("/")
     response = requests.post(
         f"{api}/bot{token}/sendMessage",
-        json={"chat_id": chat_id, "text": message},
+        json={
+            "chat_id": chat_id,
+            "text": message,
+            "reply_markup": {
+                "inline_keyboard": [[
+                    {"text": "查看失败诊断", "callback_data": "ops:diagnostic"}
+                ]]
+            },
+        },
         timeout=10,
     )
     response.raise_for_status()
