@@ -476,7 +476,15 @@ def find_green_button(image, min_width, max_width, min_height, max_height, min_y
         xs = []
         for x in range(rgb.width):
             red, green, blue = rgb.getpixel((x, y))
-            if red < 40 and 160 < green < 220 and 60 < blue < 130:
+            # ComWeChat has used both the older dark green and the newer lighter
+            # green button colors. Geometry checks below keep small icons out.
+            if (
+                red < 100
+                and 150 < green < 235
+                and 50 < blue < 180
+                and green > red * 1.35
+                and green > blue * 1.10
+            ):
                 xs.append(x)
         if len(xs) >= min_width:
             rows.append((y, min(xs), max(xs)))

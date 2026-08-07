@@ -133,6 +133,12 @@ class ButtonDetectionTests(unittest.TestCase):
 
         self.assertEqual(watchdog.find_enter_button(image), (959, 695))
 
+    def test_detects_current_wechat_green_button_color(self):
+        image = Image.new("RGB", (1920, 1200), "black")
+        ImageDraw.Draw(image).rectangle((870, 678, 1049, 713), fill=(56, 205, 127))
+
+        self.assertEqual(watchdog.find_enter_button(image), (959, 695))
+
     def test_ignores_small_green_icon(self):
         image = Image.new("RGB", (1920, 1080), "black")
         ImageDraw.Draw(image).rectangle((20, 20, 50, 50), fill=(7, 193, 96))
