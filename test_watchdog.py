@@ -182,6 +182,16 @@ class RecoveryTests(unittest.TestCase):
         self.assertFalse(watchdog.rearm_for_new_event(tracker, triggered=False))
         self.assertTrue(tracker.paused)
 
+    def test_failed_recovery_rearms_after_timed_pause(self):
+        tracker = watchdog.FailureTracker(limit=1, pause_seconds=120)
+
+        self.assertTrue(tracker.record_failure(now=100.0))
+        self.assertFalse(tracker.rearm_if_due(now=219.9))
+        self.assertTrue(tracker.paused)
+        self.assertTrue(tracker.rearm_if_due(now=220.0))
+        self.assertFalse(tracker.paused)
+        self.assertEqual(tracker.failures, 0)
+
     def test_new_night_window_rearms_paused_night_recovery(self):
         tracker = watchdog.FailureTracker(limit=1)
         tracker.record_failure()

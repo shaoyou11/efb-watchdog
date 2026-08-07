@@ -73,27 +73,41 @@ class WatchdogSettings:
 
 
 class FailureTracker:
-    def __init__(self, limit=3):
+    def __init__(self, limit=3, pause_seconds=120):
         self.limit = limit
+        self.pause_seconds = max(0, pause_seconds)
         self.failures = 0
         self.paused = False
+        self.paused_until = 0.0
         self.alerted = False
 
-    def record_failure(self):
+    def record_failure(self, now=None):
         if self.paused:
             return False
         self.failures += 1
         if self.failures < self.limit:
             return False
         self.paused = True
+        current = time.monotonic() if now is None else float(now)
+        self.paused_until = current + self.pause_seconds
         if self.alerted:
             return False
         self.alerted = True
         return True
 
+    def rearm_if_due(self, now=None):
+        if not self.paused:
+            return False
+        current = time.monotonic() if now is None else float(now)
+        if current < self.paused_until:
+            return False
+        self.reset()
+        return True
+
     def reset(self):
         self.failures = 0
         self.paused = False
+        self.paused_until = 0.0
         self.alerted = False
 
 
@@ -558,8 +572,8 @@ def main():
     login_tracker = LoginEventTracker()
     login_probe_initialized = False
     trackers = {
-        "event": FailureTracker(failure_limit),
-        "night": FailureTracker(failure_limit),
+        "event": FailureTracker(failure_limit, cooldown_seconds),
+        "night": FailureTracker(failure_limit, cooldown_seconds),
     }
 
     SETTINGS = WatchdogSettings(os.getenv("STATE_PATH", "/state/settings.json"))
@@ -629,6 +643,11 @@ def main():
                 LOGGER.info(
                     "new offline event rearmed the full event recovery flow"
                 )
+            if tracker.rearm_if_due(monotonic_now):
+                LOGGER.info(
+                    "%s recovery automatically rearmed after timed pause",
+                    recovery_source,
+                )
             if tracker.paused:
                 LOGGER.warning(
                     "%s recovery clicks paused after repeated failures",
@@ -657,13 +676,10 @@ def main():
                 else:
                     vnc_command("capture", diagnostic_path())
                     LOGGER.info("latest failed-login diagnostic saved")
-            if (
-                not restored
-                and tracker.record_failure()
-            ):
+            if not restored and tracker.record_failure(now=monotonic_now):
                 send_alert(
                     f"EFB 微信{RECOVERY_LABELS[recovery_source]}恢复连续失败 3 次，"
-                    "已暂停本类自动点击。"
+                    f"已暂停 {cooldown_seconds} 秒后自动重试。"
                     "请查看 watchdog 最新诊断画面并人工确认登录状态。"
                 )
         except Exception as error:
