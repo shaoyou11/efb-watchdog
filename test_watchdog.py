@@ -45,6 +45,19 @@ class ScheduleTests(unittest.TestCase):
         self.assertTrue(watchdog.consume_offline_trigger())
         self.assertFalse(watchdog.consume_offline_trigger())
 
+    def test_consumes_persisted_offline_trigger_once(self):
+        with TemporaryDirectory() as directory, patch.dict(
+            os.environ,
+            {"OFFLINE_EVENT_PATH": os.path.join(directory, "offline-event.json")},
+            clear=True,
+        ):
+            event_path = Path(directory) / "offline-event.json"
+            event_path.write_text('{"version": 1}\n', encoding="utf-8")
+
+            self.assertTrue(watchdog.consume_offline_trigger())
+            self.assertFalse(event_path.exists())
+            self.assertFalse(watchdog.consume_offline_trigger())
+
     def test_default_click_cooldown_matches_poll_interval(self):
         with patch.dict(os.environ, {}, clear=True):
             self.assertEqual(watchdog.click_cooldown_seconds(), 120)

@@ -203,10 +203,17 @@ def status_snapshot(settings=None) -> dict:
     return state
 
 
+def offline_event_path() -> Path:
+    return Path(os.getenv("OFFLINE_EVENT_PATH", "/state/offline-event.json"))
+
+
 def consume_offline_trigger() -> bool:
-    if not OFFLINE_EVENT.is_set():
+    pending_file = offline_event_path()
+    pending = pending_file.exists()
+    if not OFFLINE_EVENT.is_set() and not pending:
         return False
     OFFLINE_EVENT.clear()
+    pending_file.unlink(missing_ok=True)
     LOGGER.info("offline event received from EFB")
     return True
 
