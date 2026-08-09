@@ -1,32 +1,58 @@
 # EFB 微信会话自动恢复
 
-用于飞牛 NAS 上 EFB/ComWeChat 的微信登录状态检测与会话恢复，适配 Wine/Windows 微信退出后仍保留本机会话的场景。
+本项目用于飞牛 NAS 上 EFB 与 ComWechat 的微信会话检测和恢复，适配 Windows 微信退出后仍保留本机会话的情况。
 
-## 主要功能
+Watchdog 只能操作已经保留有效本机会话的微信窗口，不能绕过微信服务端风控，也不能替代重新扫码登录。
 
-- 全天接收 EFB 发出的微信离线事件，先调用登录接口复核，再执行恢复。
-- 每天 `02:50-03:50` 每 2 分钟进行一次凌晨自主检测。
-- 自动识别并依次点击“确定”和“进入微信”。
+## 功能范围
+
+- 接收 EFB 发出的全天微信离线事件。
+- 每天 `02:50–03:50` 每 2 分钟进行一次自主检测。
+- 依次识别并点击“确定”和“进入微信”。
 - 兼容 ComWeChat 新旧版本的绿色“进入微信”按钮颜色，避免欢迎页按钮因颜色变化而漏检。
-- 全天事件恢复与凌晨自主检测使用独立失败计数，互不锁死。
-- 任一来源连续失败 3 次后只暂停该来源；同一轮掉线不会再自动循环点击或重复告警。
-- 失败状态会持久化到 `/state/recovery-state.json`，Watchdog 或 NAS 重启后也不会把同一轮失败重新计数。
+- 全天事件恢复与凌晨自主检测使用独立失败计数。
+- 任一来源连续失败 3 次后，只暂停该来源，避免重复点击或无限重启。
+- 失败状态持久化到 `/state/recovery-state.json`，Watchdog 或 NAS 重启后不会将同一轮失败重新计数。
 - 新的全天离线事件、下一次凌晨窗口，或重新打开总开关/全天事件开关时，才会重新启用恢复流程。
-- 下一次凌晨窗口开始时会自动重置上一晚的暂停状态。
-- 登录恢复后自动清除失败状态和诊断画面。
+- 下一次凌晨窗口开始时自动重置上一晚的暂停状态。
+- 登录恢复后清除失败状态，并删除旧诊断画面。
 - 只保留最新一张失败诊断画面，避免持续占用 NAS 空间。
 - 支持 Telegram 中的总开关、全天事件恢复开关和凌晨自主检测开关。
 - 开关状态写入持久化文件，容器或 NAS 重启后仍然保留。
 
-## 工作流程
+## 恢复流程
+
+### 全天事件恢复
 
 1. EFB 检测到微信未登录，通过容器内部接口触发 Watchdog。
-2. Watchdog 调用 ComWeChat 登录接口复核状态。
-3. 确认离线后，通过 VNC 检测退出提示并点击“确定”。
-4. 再次检测欢迎页并点击“进入微信”。
-5. 恢复成功后清除失败状态；连续失败达到上限后停止本轮自动恢复，等待人工确认登录状态。
+2. Watchdog 调用 ComWechat 登录接口复核状态。
+3. 确认仍处于离线状态后，检测退出提示并点击“确定”。
+4. 检测欢迎页并点击“进入微信”。
+5. 再次调用登录接口确认结果。
+6. 恢复成功后清除失败状态；失败时等待 2 分钟后重试。
 
-凌晨自主检测只在配置时段运行，全天事件恢复不受凌晨时段限制。
+全天事件恢复不受凌晨自主检测时段限制。
+
+### 凌晨自主检测
+
+凌晨自主检测只在 `02:50–03:50` 运行，每 2 分钟检查一次。到达结束时间后立即停止，
+不会继续运行到下一次窗口。
+
+如果 Windows 微信提示自动登录失效或要求重新扫码，Watchdog 停止重复点击并保留诊断信息。
+此时使用 `/login` 获取新的二维码。
+
+## 失败处理
+
+| 项目 | 行为 |
+| --- | --- |
+| 重试间隔 | `POLL_SECONDS`，默认 120 秒。 |
+| 点击冷却 | `CLICK_COOLDOWN_SECONDS`，默认 120 秒。 |
+| 暂停阈值 | `MAX_RECOVERY_FAILURES`，默认连续失败 3 次。 |
+| 全天事件来源 | 只暂停全天事件恢复；收到新的离线事件时重新启用。 |
+| 凌晨检测来源 | 只暂停凌晨自主检测；下一次凌晨窗口开始时重置。 |
+| 诊断画面 | 只保留 `last-login-failure.png`，恢复成功后清理。 |
+
+Watchdog 不会因为恢复失败而无限重启 ComWechat。容器重启和微信界面恢复由不同的健康守护逻辑负责。
 
 ## 镜像
 
@@ -34,31 +60,41 @@
 ghcr.io/shaoyou11/efb-watchdog:latest
 ```
 
-`latest` 始终对应本仓库 `main` 分支通过测试后的最新构建，同时生成提交版本标签，便于故障时回滚。
+`latest` 对应本仓库 `main` 分支通过测试后的最新构建，同时生成提交版本标签，便于故障时回滚。
 
-## 主要配置
+## 配置
 
 | 变量 | 默认值 | 作用 |
 | --- | --- | --- |
-| `TZ` | `Asia/Shanghai` | 时区 |
-| `VNC_SERVER` | `127.0.0.1::5905` | 微信桌面的 VNC 地址 |
-| `WECHAT_LOGIN_URL` | 容器内登录接口 | ComWeChat 登录状态接口 |
-| `DAILY_START` | `02:50` | 凌晨自主检测开始时间 |
-| `DAILY_END` | `03:50` | 凌晨自主检测结束时间 |
-| `POLL_SECONDS` | `120` | 检测和重试间隔 |
-| `CLICK_COOLDOWN_SECONDS` | `120` | 两次自动点击之间的冷却时间 |
-| `MAX_RECOVERY_FAILURES` | `3` | 单一恢复来源连续失败暂停阈值；达到后保持暂停，直到明确的重新恢复事件 |
-| `TRIGGER_PORT` | `18989` | EFB 离线事件触发接口端口 |
-| `STATE_PATH` | `/state/settings.json` | 开关状态持久化文件 |
-| `RECOVERY_STATE_PATH` | `/state/recovery-state.json` | 失败计数、暂停状态和恢复来源持久化文件 |
-| `DIAGNOSTIC_PATH` | `/diagnostics/last-login-failure.png` | 最新失败诊断画面 |
-| `HEARTBEAT_PATH` | `/tmp/watchdog-heartbeat` | 健康检查心跳文件 |
+| `TZ` | `Asia/Shanghai` | 运行时区。 |
+| `VNC_SERVER` | `127.0.0.1::5905` | 微信桌面的 VNC 地址。 |
+| `WECHAT_LOGIN_URL` | 容器内登录接口 | ComWechat 登录状态接口。 |
+| `DAILY_START` | `02:50` | 凌晨自主检测开始时间。 |
+| `DAILY_END` | `03:50` | 凌晨自主检测结束时间。 |
+| `POLL_SECONDS` | `120` | 检测和重试间隔，单位为秒。 |
+| `CLICK_COOLDOWN_SECONDS` | `120` | 两次自动点击之间的冷却时间，单位为秒。 |
+| `MAX_RECOVERY_FAILURES` | `3` | 单一恢复来源连续失败暂停阈值；达到后保持暂停，直到明确的重新恢复事件。 |
+| `TRIGGER_PORT` | `18989` | EFB 离线事件触发接口端口。 |
+| `STATE_PATH` | `/state/settings.json` | 开关状态持久化文件。 |
+| `RECOVERY_STATE_PATH` | `/state/recovery-state.json` | 失败计数、暂停状态和恢复来源持久化文件。 |
+| `DIAGNOSTIC_PATH` | `/diagnostics/last-login-failure.png` | 最新失败诊断画面。 |
+| `HEARTBEAT_PATH` | `/tmp/watchdog-heartbeat` | 健康检查心跳文件。 |
 
-真实密码、Token、聊天 ID 和运行配置不提交到本公开仓库，应只保存在 NAS 的私有配置目录中。
+真实密码、Token、聊天 ID 和运行配置不提交到公开仓库，只保存在 NAS 的私有配置目录。
 
-## 持久化建议
+## Telegram 控制
 
-容器至少应持久化以下目录：
+EFB Telegram 主端提供 `/watchdog` 管理入口，可分别控制：
+
+- 总开关。
+- 全天事件恢复。
+- 凌晨自主检测。
+
+设置保存在 `watchdog/state/settings.json`。设置关闭后，Watchdog 不会主动执行对应来源的恢复动作。
+
+## 持久化
+
+Compose 至少挂载以下目录：
 
 ```yaml
 volumes:
@@ -70,12 +106,18 @@ volumes:
 
 - `/state/settings.json` 保存 Telegram 控制开关。
 - `/state/recovery-state.json` 保存当前恢复来源和失败状态；不包含密码、Token、二维码或聊天内容。
-- `/diagnostics/last-login-failure.png` 仅保存最新失败画面。
+- `/diagnostics/last-login-failure.png` 只保存最新失败画面。
 
-## 本地测试
+## 健康检查与测试
+
+健康检查使用 `/tmp/watchdog-heartbeat` 判断进程是否仍在运行。EFB 负责检查微信登录状态并发送全天事件，
+Watchdog 负责复核界面和执行有限恢复，两者不共享失败计数。
+
+本地运行测试：
 
 ```bash
 python -m unittest test_watchdog.py
 ```
 
-每次推送到 `main` 后，GitHub Actions 会先运行测试，再构建并发布 GHCR 镜像。公开仓库保存程序源码；私有配置库只保存 NAS 部署配置、持久化说明和灾备副本。
+每次推送到 `main` 后，GitHub Actions 先运行测试，再构建并发布 GHCR 镜像。公开仓库保存程序源码；
+私有配置库保存 NAS 部署配置、持久化说明和灾备副本。
