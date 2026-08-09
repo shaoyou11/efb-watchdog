@@ -73,8 +73,12 @@ class WatchdogSettings:
 
 
 class FailureTracker:
+    """Latch recovery failures until an explicit recovery event resets them."""
+
     def __init__(self, limit=3, pause_seconds=120):
         self.limit = limit
+        # Kept for configuration compatibility. A failed episode is no longer
+        # rearmed by this timer.
         self.pause_seconds = max(0, pause_seconds)
         self.failures = 0
         self.paused = False
@@ -88,27 +92,98 @@ class FailureTracker:
         if self.failures < self.limit:
             return False
         self.paused = True
-        current = time.monotonic() if now is None else float(now)
-        self.paused_until = current + self.pause_seconds
+        self.paused_until = 0.0
         if self.alerted:
             return False
         self.alerted = True
         return True
 
     def rearm_if_due(self, now=None):
-        if not self.paused:
-            return False
-        current = time.monotonic() if now is None else float(now)
-        if current < self.paused_until:
-            return False
-        self.reset()
-        return True
+        """Compatibility shim: timed rearming is intentionally disabled."""
+        return False
+
+    def snapshot(self):
+        return {
+            "failures": self.failures,
+            "paused": self.paused,
+            "alerted": self.alerted,
+        }
+
+    def restore(self, payload):
+        if not isinstance(payload, dict):
+            return
+        try:
+            failures = max(0, int(payload.get("failures", 0)))
+        except (TypeError, ValueError):
+            failures = 0
+        self.failures = min(failures, self.limit)
+        self.paused = bool(payload.get("paused", False))
+        self.alerted = bool(payload.get("alerted", False))
+        self.paused_until = 0.0
+        if self.paused:
+            self.failures = max(self.failures, self.limit)
+            self.alerted = True
 
     def reset(self):
         self.failures = 0
         self.paused = False
         self.paused_until = 0.0
         self.alerted = False
+
+
+class RecoveryStateStore:
+    """Persist recovery latches without storing credentials or message data."""
+
+    VALID_SOURCES = {"event", "night"}
+
+    def __init__(self, path):
+        self.path = Path(path)
+
+    def load(self):
+        try:
+            payload = json.loads(self.path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, OSError, ValueError, TypeError, json.JSONDecodeError):
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
+    def restore(self, trackers):
+        payload = self.load()
+        stored_trackers = payload.get("trackers", {})
+        if isinstance(stored_trackers, dict):
+            for source, tracker in trackers.items():
+                tracker.restore(stored_trackers.get(source))
+        active_source = payload.get("active_source")
+        if active_source not in self.VALID_SOURCES:
+            active_source = None
+        night_window = payload.get("night_window")
+        if not isinstance(night_window, str):
+            night_window = None
+        return active_source, night_window
+
+    def save(self, active_source, trackers, night_window=None):
+        payload = {
+            "version": 1,
+            "active_source": (
+                active_source if active_source in self.VALID_SOURCES else None
+            ),
+            "night_window": night_window,
+            "trackers": {
+                source: tracker.snapshot() for source, tracker in trackers.items()
+            },
+            "updated_at": time.time(),
+        }
+        temporary = self.path.with_suffix(self.path.suffix + ".tmp")
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            temporary.write_text(
+                json.dumps(payload, ensure_ascii=True, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            os.replace(temporary, self.path)
+        except OSError as error:
+            LOGGER.warning("failed to persist recovery state: %s", error)
+        finally:
+            temporary.unlink(missing_ok=True)
 
 
 def rearm_for_new_event(tracker, triggered):
@@ -190,6 +265,9 @@ def watchdog_runtime_config() -> dict:
         "poll_seconds": _env_int("POLL_SECONDS", 120),
         "click_cooldown_seconds": _env_int("CLICK_COOLDOWN_SECONDS", 120),
         "max_recovery_failures": _env_int("MAX_RECOVERY_FAILURES", 3),
+        "recovery_state_path": os.getenv(
+            "RECOVERY_STATE_PATH", "/state/recovery-state.json"
+        ),
         "timezone": os.getenv("TZ", "Asia/Shanghai"),
         "diagnostic_retention": "仅保留最新一张",
     }
@@ -205,6 +283,10 @@ def status_snapshot(settings=None) -> dict:
 
 def offline_event_path() -> Path:
     return Path(os.getenv("OFFLINE_EVENT_PATH", "/state/offline-event.json"))
+
+
+def recovery_state_path() -> Path:
+    return Path(os.getenv("RECOVERY_STATE_PATH", "/state/recovery-state.json"))
 
 
 def consume_offline_trigger() -> bool:
@@ -272,6 +354,12 @@ class TriggerHandler(BaseHTTPRequestHandler):
         except (ValueError, OSError, json.JSONDecodeError):
             self._send_json(400, {"error": "invalid request"})
             return
+        if (
+            payload.get("setting") in {"event", "master"}
+            and payload.get("enabled") is True
+        ):
+            # Re-enabling recovery is the explicit manual rearm.
+            OFFLINE_EVENT.set()
         CONTROL_CHANGED.set()
         self._send_json(200, state)
 
@@ -581,17 +669,22 @@ def main():
     cooldown_seconds = click_cooldown_seconds()
     last_check = 0.0
     last_attempt = 0.0
-    recovery_source = None
-    was_scheduled = False
     failure_limit = int(os.getenv("MAX_RECOVERY_FAILURES", "3"))
     login_tracker = LoginEventTracker()
     login_probe_initialized = False
+    SETTINGS = WatchdogSettings(os.getenv("STATE_PATH", "/state/settings.json"))
+    recovery_store = RecoveryStateStore(recovery_state_path())
     trackers = {
         "event": FailureTracker(failure_limit, cooldown_seconds),
         "night": FailureTracker(failure_limit, cooldown_seconds),
     }
+    recovery_source, night_window = recovery_store.restore(trackers)
+    was_scheduled = False
 
-    SETTINGS = WatchdogSettings(os.getenv("STATE_PATH", "/state/settings.json"))
+    def persist_recovery_state():
+        recovery_store.save(recovery_source, trackers, night_window)
+
+    persist_recovery_state()
     start_trigger_server()
     LOGGER.info("watchdog started")
     while True:
@@ -603,13 +696,20 @@ def main():
         night_enabled = effective_night_enabled(state)
         triggered = consume_offline_trigger() and event_enabled
         scheduled = schedule_active(now) and night_enabled
+        previous_night_window = night_window
+        current_night_window = now.date().isoformat() if scheduled else None
         if rearm_for_new_night_window(
             trackers["night"],
             scheduled,
-            was_scheduled,
+            was_scheduled or night_window == current_night_window,
         ):
             LOGGER.info("new night window rearmed night recovery")
+            persist_recovery_state()
+        night_window = current_night_window
         was_scheduled = scheduled
+        if previous_night_window != night_window:
+            persist_recovery_state()
+        previous_source = recovery_source
         if recovery_source == "event" and not event_enabled:
             recovery_source = None
         if recovery_source == "night" and not night_enabled:
@@ -619,6 +719,8 @@ def main():
             triggered,
             scheduled,
         )
+        if previous_source != recovery_source:
+            persist_recovery_state()
         if not check_due(
             triggered,
             scheduled,
@@ -641,10 +743,15 @@ def main():
                 elif login_tracker.observe("logged_in", time.time()):
                     mark_login_event("manual")
                     send_login_success("manual")
+                had_recovery_state = recovery_source is not None or any(
+                    tracker.failures or tracker.paused for tracker in trackers.values()
+                )
                 recovery_source = None
                 for tracker in trackers.values():
                     tracker.reset()
                 clear_diagnostic()
+                if had_recovery_state:
+                    persist_recovery_state()
                 continue
 
             login_probe_initialized = True
@@ -657,11 +764,6 @@ def main():
             ):
                 LOGGER.info(
                     "new offline event rearmed the full event recovery flow"
-                )
-            if tracker.rearm_if_due(monotonic_now):
-                LOGGER.info(
-                    "%s recovery automatically rearmed after timed pause",
-                    recovery_source,
                 )
             if tracker.paused:
                 LOGGER.warning(
@@ -688,15 +790,21 @@ def main():
                     mark_recovery_success(recovered_source)
                     recovery_source = None
                     clear_diagnostic()
+                    persist_recovery_state()
                 else:
                     vnc_command("capture", diagnostic_path())
                     LOGGER.info("latest failed-login diagnostic saved")
-            if not restored and tracker.record_failure(now=monotonic_now):
-                send_alert(
-                    f"EFB 微信{RECOVERY_LABELS[recovery_source]}恢复连续失败 3 次，"
-                    f"已暂停 {cooldown_seconds} 秒后自动重试。"
-                    "请查看 watchdog 最新诊断画面并人工确认登录状态。"
-                )
+            if not restored:
+                previous_tracker_state = tracker.snapshot()
+                should_alert = tracker.record_failure(now=monotonic_now)
+                if tracker.snapshot() != previous_tracker_state:
+                    persist_recovery_state()
+                if should_alert:
+                    send_alert(
+                        f"EFB 微信{RECOVERY_LABELS[recovery_source]}恢复连续失败 "
+                        f"{tracker.limit} 次，本次自动恢复已停止，不会继续重试。"
+                        "请查看 watchdog 最新诊断画面并人工确认登录状态。"
+                    )
         except Exception as error:
             LOGGER.warning("watchdog check failed: %s", error)
 

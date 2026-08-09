@@ -9,8 +9,9 @@
 - 自动识别并依次点击“确定”和“进入微信”。
 - 兼容 ComWeChat 新旧版本的绿色“进入微信”按钮颜色，避免欢迎页按钮因颜色变化而漏检。
 - 全天事件恢复与凌晨自主检测使用独立失败计数，互不锁死。
-- 任一来源连续失败 3 次后只暂停该来源，等待一个 2 分钟冷却后自动复位重试，避免长期锁死。
-- 新的全天离线事件会重新启用一次完整恢复流程；连续失败后的定时复位也会自动重新尝试。
+- 任一来源连续失败 3 次后只暂停该来源；同一轮掉线不会再自动循环点击或重复告警。
+- 失败状态会持久化到 `/state/recovery-state.json`，Watchdog 或 NAS 重启后也不会把同一轮失败重新计数。
+- 新的全天离线事件、下一次凌晨窗口，或重新打开总开关/全天事件开关时，才会重新启用恢复流程。
 - 下一次凌晨窗口开始时会自动重置上一晚的暂停状态。
 - 登录恢复后自动清除失败状态和诊断画面。
 - 只保留最新一张失败诊断画面，避免持续占用 NAS 空间。
@@ -23,7 +24,7 @@
 2. Watchdog 调用 ComWeChat 登录接口复核状态。
 3. 确认离线后，通过 VNC 检测退出提示并点击“确定”。
 4. 再次检测欢迎页并点击“进入微信”。
-5. 恢复成功后清除失败状态；失败则等待 2 分钟后重试。
+5. 恢复成功后清除失败状态；连续失败达到上限后停止本轮自动恢复，等待人工确认登录状态。
 
 凌晨自主检测只在配置时段运行，全天事件恢复不受凌晨时段限制。
 
@@ -46,9 +47,10 @@ ghcr.io/shaoyou11/efb-watchdog:latest
 | `DAILY_END` | `03:50` | 凌晨自主检测结束时间 |
 | `POLL_SECONDS` | `120` | 检测和重试间隔 |
 | `CLICK_COOLDOWN_SECONDS` | `120` | 两次自动点击之间的冷却时间 |
-| `MAX_RECOVERY_FAILURES` | `3` | 单一恢复来源连续失败暂停阈值，之后按点击冷却时间自动复位 |
+| `MAX_RECOVERY_FAILURES` | `3` | 单一恢复来源连续失败暂停阈值；达到后保持暂停，直到明确的重新恢复事件 |
 | `TRIGGER_PORT` | `18989` | EFB 离线事件触发接口端口 |
 | `STATE_PATH` | `/state/settings.json` | 开关状态持久化文件 |
+| `RECOVERY_STATE_PATH` | `/state/recovery-state.json` | 失败计数、暂停状态和恢复来源持久化文件 |
 | `DIAGNOSTIC_PATH` | `/diagnostics/last-login-failure.png` | 最新失败诊断画面 |
 | `HEARTBEAT_PATH` | `/tmp/watchdog-heartbeat` | 健康检查心跳文件 |
 
@@ -67,6 +69,7 @@ volumes:
 其中：
 
 - `/state/settings.json` 保存 Telegram 控制开关。
+- `/state/recovery-state.json` 保存当前恢复来源和失败状态；不包含密码、Token、二维码或聊天内容。
 - `/diagnostics/last-login-failure.png` 仅保存最新失败画面。
 
 ## 本地测试

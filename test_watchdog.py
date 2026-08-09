@@ -201,15 +201,40 @@ class RecoveryTests(unittest.TestCase):
         self.assertFalse(watchdog.rearm_for_new_event(tracker, triggered=False))
         self.assertTrue(tracker.paused)
 
-    def test_failed_recovery_rearms_after_timed_pause(self):
+    def test_failed_recovery_stays_paused_after_timed_pause(self):
         tracker = watchdog.FailureTracker(limit=1, pause_seconds=120)
 
         self.assertTrue(tracker.record_failure(now=100.0))
         self.assertFalse(tracker.rearm_if_due(now=219.9))
         self.assertTrue(tracker.paused)
-        self.assertTrue(tracker.rearm_if_due(now=220.0))
-        self.assertFalse(tracker.paused)
-        self.assertEqual(tracker.failures, 0)
+        self.assertFalse(tracker.rearm_if_due(now=220.0))
+        self.assertTrue(tracker.paused)
+        self.assertFalse(tracker.record_failure(now=221.0))
+
+    def test_recovery_state_restores_paused_tracker(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "recovery-state.json"
+            store = watchdog.RecoveryStateStore(path)
+            trackers = {
+                "event": watchdog.FailureTracker(limit=3),
+                "night": watchdog.FailureTracker(limit=3),
+            }
+            trackers["event"].record_failure()
+            trackers["event"].record_failure()
+            trackers["event"].record_failure()
+            store.save("event", trackers, "2026-08-09")
+
+            restored_trackers = {
+                "event": watchdog.FailureTracker(limit=3),
+                "night": watchdog.FailureTracker(limit=3),
+            }
+            source, night_window = store.restore(restored_trackers)
+
+        self.assertEqual(source, "event")
+        self.assertEqual(night_window, "2026-08-09")
+        self.assertEqual(restored_trackers["event"].failures, 3)
+        self.assertTrue(restored_trackers["event"].paused)
+        self.assertFalse(restored_trackers["night"].paused)
 
     def test_new_night_window_rearms_paused_night_recovery(self):
         tracker = watchdog.FailureTracker(limit=1)
