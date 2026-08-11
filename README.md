@@ -72,6 +72,8 @@ ghcr.io/shaoyou11/efb-watchdog:latest
 | `DAILY_START` | `02:50` | 凌晨自主检测开始时间。 |
 | `DAILY_END` | `03:50` | 凌晨自主检测结束时间。 |
 | `POLL_SECONDS` | `120` | 检测和重试间隔，单位为秒。 |
+| `LOGIN_CONFIRM_PROBES` | `3` | 登录成功前的连续状态确认次数。 |
+| `LOGIN_CONFIRM_INTERVAL_SECONDS` | `3` | 连续登录状态确认间隔，单位为秒。 |
 | `CLICK_COOLDOWN_SECONDS` | `120` | 两次自动点击之间的冷却时间，单位为秒。 |
 | `MAX_RECOVERY_FAILURES` | `3` | 单一恢复来源连续失败暂停阈值；达到后保持暂停，直到明确的重新恢复事件。 |
 | `TRIGGER_PORT` | `18989` | EFB 离线事件触发接口端口。 |
