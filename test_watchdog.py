@@ -160,6 +160,34 @@ class ButtonDetectionTests(unittest.TestCase):
 
 
 class RecoveryTests(unittest.TestCase):
+    @patch("watchdog.time.sleep")
+    def test_login_success_requires_consecutive_probes(self, sleep):
+        check = Mock(side_effect=[True, True, True])
+
+        self.assertTrue(
+            watchdog.confirm_logged_in(
+                check=check,
+                probes=3,
+                interval_seconds=2,
+            )
+        )
+        self.assertEqual(check.call_count, 3)
+        self.assertEqual(sleep.call_count, 2)
+
+    @patch("watchdog.time.sleep")
+    def test_transient_login_state_is_not_success(self, sleep):
+        check = Mock(side_effect=[True, False])
+
+        self.assertFalse(
+            watchdog.confirm_logged_in(
+                check=check,
+                probes=3,
+                interval_seconds=2,
+            )
+        )
+        self.assertEqual(check.call_count, 2)
+        self.assertEqual(sleep.call_count, 1)
+
     def test_manual_and_automatic_success_events_are_not_duplicated(self):
         tracker = watchdog.LoginEventTracker()
 

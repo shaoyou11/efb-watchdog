@@ -247,6 +247,23 @@ def is_logged_in() -> bool:
     return response.json().get("is_login", 0) == 1
 
 
+def confirm_logged_in(check=None, probes=None, interval_seconds=None) -> bool:
+    """Require a stable login state before announcing recovery success."""
+    check = check or is_logged_in
+    probes = probes or _env_int("LOGIN_CONFIRM_PROBES", 3)
+    interval_seconds = (
+        interval_seconds
+        if interval_seconds is not None
+        else _env_int("LOGIN_CONFIRM_INTERVAL_SECONDS", 3)
+    )
+    for index in range(probes):
+        if not check():
+            return False
+        if index + 1 < probes:
+            time.sleep(interval_seconds)
+    return True
+
+
 def click_cooldown_seconds() -> int:
     return int(os.getenv("CLICK_COOLDOWN_SECONDS", "120"))
 
@@ -265,6 +282,10 @@ def watchdog_runtime_config() -> dict:
         "poll_seconds": _env_int("POLL_SECONDS", 120),
         "click_cooldown_seconds": _env_int("CLICK_COOLDOWN_SECONDS", 120),
         "max_recovery_failures": _env_int("MAX_RECOVERY_FAILURES", 3),
+        "login_confirm_probes": _env_int("LOGIN_CONFIRM_PROBES", 3),
+        "login_confirm_interval_seconds": _env_int(
+            "LOGIN_CONFIRM_INTERVAL_SECONDS", 3
+        ),
         "recovery_state_path": os.getenv(
             "RECOVERY_STATE_PATH", "/state/recovery-state.json"
         ),
@@ -734,6 +755,15 @@ def main():
 
         try:
             logged_in = is_logged_in()
+            if logged_in and login_tracker.state != "logged_in":
+                logged_in = confirm_logged_in()
+                if not logged_in:
+                    LOGGER.warning(
+                        "wechat login state was transient; success notification suppressed"
+                    )
+                    login_tracker.observe("unknown", time.time())
+                    OFFLINE_EVENT.wait(timeout=5)
+                    continue
             if logged_in:
                 LOGGER.info("wechat is logged in")
                 last_attempt = 0.0
@@ -778,7 +808,7 @@ def main():
             if capture_and_click():
                 last_attempt = monotonic_now
                 time.sleep(30)
-                restored = is_logged_in()
+                restored = confirm_logged_in()
                 LOGGER.info("login restored=%s", restored)
                 if restored:
                     recovered_source = recovery_source
