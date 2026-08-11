@@ -26,7 +26,7 @@ jobs:
           push: false
 
   publish:
-    if: github.event_name != 'pull_request'
+    if: github.event_name == 'push'
     needs: test-and-canary
     runs-on: ubuntu-latest
     permissions:
