@@ -161,6 +161,48 @@ class ButtonDetectionTests(unittest.TestCase):
 
 class RecoveryTests(unittest.TestCase):
     @patch("watchdog.time.sleep")
+    def test_operational_login_requires_stable_stack_and_hooks(self, sleep):
+        probes = [
+            (True, "stack-a"),
+            (True, "stack-a"),
+            (True, "stack-a"),
+        ]
+        with patch("watchdog.operational_login_probe", side_effect=probes) as probe:
+            self.assertTrue(
+                watchdog.confirm_operational_login(probes=3, interval_seconds=2)
+            )
+        self.assertEqual(probe.call_args_list[1].args, ("stack-a",))
+        self.assertEqual(sleep.call_count, 2)
+
+    @patch("watchdog.time.sleep")
+    def test_operational_login_rejects_stack_restart(self, _sleep):
+        probes = [(True, "stack-a"), (False, "stack-b")]
+        with patch("watchdog.operational_login_probe", side_effect=probes):
+            self.assertFalse(
+                watchdog.confirm_operational_login(probes=3, interval_seconds=0)
+            )
+
+    def test_operational_probe_requires_login_and_hooks(self):
+        with patch("watchdog.is_logged_in", return_value=True), patch(
+            "watchdog.bridge_state",
+            return_value={
+                "ok": True,
+                "hooks_ready": True,
+                "is_login": False,
+                "stack_generation": "stack-a",
+            },
+        ):
+            self.assertEqual(watchdog.operational_login_probe(), (False, "stack-a"))
+
+    @patch("watchdog.requests.post")
+    def test_stack_recovery_request_is_bounded_and_local(self, post):
+        post.return_value.raise_for_status.return_value = None
+
+        self.assertTrue(watchdog.request_stack_recovery())
+        self.assertEqual(post.call_count, 1)
+        self.assertEqual(post.call_args.args[0], "http://127.0.0.1:19089/recover")
+
+    @patch("watchdog.time.sleep")
     def test_login_success_requires_consecutive_probes(self, sleep):
         check = Mock(side_effect=[True, True, True])
 

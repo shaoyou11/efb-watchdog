@@ -264,6 +264,69 @@ def confirm_logged_in(check=None, probes=None, interval_seconds=None) -> bool:
     return True
 
 
+def bridge_state() -> dict:
+    response = requests.get(
+        os.getenv("WECHAT_BRIDGE_HEALTH_URL", "http://127.0.0.1:19088/healthz"),
+        timeout=5,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    return payload if isinstance(payload, dict) else {}
+
+
+def operational_login_probe(expected_generation=None) -> tuple[bool, str]:
+    if not is_logged_in():
+        return False, ""
+    state = bridge_state()
+    generation = str(state.get("stack_generation", ""))
+    ready = (
+        state.get("ok") is True
+        and state.get("hooks_ready") is True
+        and state.get("is_login") is True
+        and bool(generation)
+    )
+    if expected_generation and generation != expected_generation:
+        return False, generation
+    return ready, generation
+
+
+def confirm_operational_login(probes=None, interval_seconds=None) -> bool:
+    """Confirm login, hooks and one unchanged WeChat stack generation."""
+    probes = probes or _env_int("LOGIN_CONFIRM_PROBES", 5)
+    interval_seconds = (
+        interval_seconds
+        if interval_seconds is not None
+        else _env_int("LOGIN_CONFIRM_INTERVAL_SECONDS", 5)
+    )
+    generation = None
+    for index in range(probes):
+        ready, current_generation = operational_login_probe(generation)
+        if not ready:
+            return False
+        generation = current_generation
+        if index + 1 < probes:
+            time.sleep(interval_seconds)
+    return True
+
+
+def request_stack_recovery() -> bool:
+    try:
+        response = requests.post(
+            os.getenv(
+                "WECHAT_SUPERVISOR_RECOVER_URL",
+                "http://127.0.0.1:19089/recover",
+            ),
+            data=b"{}",
+            timeout=5,
+        )
+        response.raise_for_status()
+        LOGGER.warning("requested one bounded ComWechat stack recovery")
+        return True
+    except requests.RequestException as error:
+        LOGGER.warning("unable to request ComWechat stack recovery: %s", error)
+        return False
+
+
 def click_cooldown_seconds() -> int:
     return int(os.getenv("CLICK_COOLDOWN_SECONDS", "120"))
 
@@ -282,10 +345,11 @@ def watchdog_runtime_config() -> dict:
         "poll_seconds": _env_int("POLL_SECONDS", 120),
         "click_cooldown_seconds": _env_int("CLICK_COOLDOWN_SECONDS", 120),
         "max_recovery_failures": _env_int("MAX_RECOVERY_FAILURES", 3),
-        "login_confirm_probes": _env_int("LOGIN_CONFIRM_PROBES", 3),
+        "login_confirm_probes": _env_int("LOGIN_CONFIRM_PROBES", 5),
         "login_confirm_interval_seconds": _env_int(
-            "LOGIN_CONFIRM_INTERVAL_SECONDS", 3
+            "LOGIN_CONFIRM_INTERVAL_SECONDS", 5
         ),
+        "pipeline_confirmation": True,
         "recovery_state_path": os.getenv(
             "RECOVERY_STATE_PATH", "/state/recovery-state.json"
         ),
@@ -756,12 +820,27 @@ def main():
         try:
             logged_in = is_logged_in()
             if logged_in and login_tracker.state != "logged_in":
-                logged_in = confirm_logged_in()
+                logged_in = confirm_operational_login()
                 if not logged_in:
                     LOGGER.warning(
-                        "wechat login state was transient; success notification suppressed"
+                        "wechat login or message pipeline was transient; "
+                        "success notification suppressed"
                     )
                     login_tracker.observe("unknown", time.time())
+                    if recovery_source is not None:
+                        request_stack_recovery()
+                        tracker = trackers[recovery_source]
+                        previous_tracker_state = tracker.snapshot()
+                        should_alert = tracker.record_failure(now=monotonic_now)
+                        if tracker.snapshot() != previous_tracker_state:
+                            persist_recovery_state()
+                        if should_alert:
+                            send_alert(
+                                f"EFB 微信{RECOVERY_LABELS[recovery_source]}恢复连续失败 "
+                                f"{tracker.limit} 次，本次自动恢复已停止。"
+                                "登录接口或消息 Hook 未能持续稳定，请使用 /login "
+                                "重新扫码；无需在 NAS 旁操作。"
+                            )
                     OFFLINE_EVENT.wait(timeout=5)
                     continue
             if logged_in:
@@ -808,7 +887,7 @@ def main():
             if capture_and_click():
                 last_attempt = monotonic_now
                 time.sleep(30)
-                restored = confirm_logged_in()
+                restored = confirm_operational_login()
                 LOGGER.info("login restored=%s", restored)
                 if restored:
                     recovered_source = recovery_source
@@ -825,6 +904,7 @@ def main():
                     vnc_command("capture", diagnostic_path())
                     LOGGER.info("latest failed-login diagnostic saved")
             if not restored:
+                request_stack_recovery()
                 previous_tracker_state = tracker.snapshot()
                 should_alert = tracker.record_failure(now=monotonic_now)
                 if tracker.snapshot() != previous_tracker_state:
