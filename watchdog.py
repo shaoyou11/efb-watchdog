@@ -350,6 +350,8 @@ def watchdog_runtime_config() -> dict:
             "LOGIN_CONFIRM_INTERVAL_SECONDS", 5
         ),
         "pipeline_confirmation": True,
+        "startup_grace_seconds": _env_int("STARTUP_GRACE_SECONDS", 90),
+        "manual_login_protection": True,
         "recovery_state_path": os.getenv(
             "RECOVERY_STATE_PATH", "/state/recovery-state.json"
         ),
@@ -372,6 +374,33 @@ def offline_event_path() -> Path:
 
 def recovery_state_path() -> Path:
     return Path(os.getenv("RECOVERY_STATE_PATH", "/state/recovery-state.json"))
+
+
+def manual_login_session_path() -> Path:
+    return Path(os.getenv(
+        "MANUAL_LOGIN_SESSION_PATH",
+        "/state/manual-login-session.json",
+    ))
+
+
+def manual_login_session_active(now=None) -> bool:
+    now = time.time() if now is None else float(now)
+    target = manual_login_session_path()
+    try:
+        payload = json.loads(target.read_text(encoding="utf-8"))
+        expires_at = float(payload["expires_at"])
+    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+        return False
+    if expires_at > now:
+        return True
+    target.unlink(missing_ok=True)
+    return False
+
+
+def startup_grace_active(started_at, now=None) -> bool:
+    now = time.monotonic() if now is None else float(now)
+    seconds = _env_int("STARTUP_GRACE_SECONDS", 90)
+    return now - float(started_at) < seconds
 
 
 def consume_offline_trigger() -> bool:
@@ -625,11 +654,6 @@ def send_alert(message):
     )
 
 
-def send_login_success(source: str):
-    labels = {"manual": "手动登录", "automatic": "自动恢复"}
-    _send_telegram_notice(f"EFB 微信登录成功（{labels.get(source, source)}）")
-
-
 def find_enter_button(image: Image.Image):
     return find_green_button(image, 140, 260, 25, 70, 0.45, 0.80)
 
@@ -757,6 +781,7 @@ def main():
     failure_limit = int(os.getenv("MAX_RECOVERY_FAILURES", "3"))
     login_tracker = LoginEventTracker()
     login_probe_initialized = False
+    started_at = time.monotonic()
     SETTINGS = WatchdogSettings(os.getenv("STATE_PATH", "/state/settings.json"))
     recovery_store = RecoveryStateStore(recovery_state_path())
     trackers = {
@@ -806,6 +831,20 @@ def main():
         )
         if previous_source != recovery_source:
             persist_recovery_state()
+        if recovery_source is not None and manual_login_session_active():
+            LOGGER.info(
+                "manual QR login session is active; automatic clicks and "
+                "stack recovery are deferred"
+            )
+            OFFLINE_EVENT.wait(timeout=5)
+            continue
+        if recovery_source is not None and startup_grace_active(
+            started_at,
+            monotonic_now,
+        ):
+            LOGGER.info("watchdog startup grace is active; recovery is deferred")
+            OFFLINE_EVENT.wait(timeout=5)
+            continue
         if not check_due(
             triggered,
             scheduled,
@@ -851,7 +890,6 @@ def main():
                     login_probe_initialized = True
                 elif login_tracker.observe("logged_in", time.time()):
                     mark_login_event("manual")
-                    send_login_success("manual")
                 had_recovery_state = recovery_source is not None or any(
                     tracker.failures or tracker.paused for tracker in trackers.values()
                 )
@@ -893,7 +931,6 @@ def main():
                     recovered_source = recovery_source
                     if login_tracker.automatic_success(time.time()):
                         mark_login_event("automatic")
-                        send_login_success("automatic")
                     for item in trackers.values():
                         item.reset()
                     mark_recovery_success(recovered_source)

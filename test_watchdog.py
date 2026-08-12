@@ -13,6 +13,26 @@ import watchdog
 
 
 class ScheduleTests(unittest.TestCase):
+    def test_startup_grace_defers_recovery_only_until_deadline(self):
+        with patch.dict(os.environ, {"STARTUP_GRACE_SECONDS": "90"}, clear=True):
+            self.assertTrue(watchdog.startup_grace_active(100.0, now=189.9))
+            self.assertFalse(watchdog.startup_grace_active(100.0, now=190.0))
+
+    def test_manual_login_session_is_persisted_and_expires(self):
+        with TemporaryDirectory() as directory, patch.dict(
+            os.environ,
+            {"MANUAL_LOGIN_SESSION_PATH": str(Path(directory) / "login.json")},
+            clear=True,
+        ):
+            target = Path(directory) / "login.json"
+            target.write_text(
+                json.dumps({"version": 1, "expires_at": 200}) + "\n",
+                encoding="utf-8",
+            )
+            self.assertTrue(watchdog.manual_login_session_active(now=199))
+            self.assertFalse(watchdog.manual_login_session_active(now=200))
+            self.assertFalse(target.exists())
+
     def test_efb_event_is_processed_outside_daily_window(self):
         self.assertTrue(watchdog.check_due(True, False, False, 0, 120))
 
@@ -119,6 +139,7 @@ class SettingsTests(unittest.TestCase):
                 "POLL_SECONDS": "120",
                 "CLICK_COOLDOWN_SECONDS": "120",
                 "MAX_RECOVERY_FAILURES": "3",
+                "STARTUP_GRACE_SECONDS": "90",
                 "TZ": "Asia/Shanghai",
             }
             with patch.dict(os.environ, environment, clear=True):
@@ -130,6 +151,8 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(state["poll_seconds"], 120)
         self.assertEqual(state["click_cooldown_seconds"], 120)
         self.assertEqual(state["max_recovery_failures"], 3)
+        self.assertEqual(state["startup_grace_seconds"], 90)
+        self.assertTrue(state["manual_login_protection"])
         self.assertEqual(state["timezone"], "Asia/Shanghai")
 
 
@@ -371,20 +394,6 @@ class RecoveryTests(unittest.TestCase):
             self.assertEqual(payload["source"], "event")
             self.assertIsInstance(payload["created_at"], float)
             self.assertFalse(target.with_suffix(target.suffix + ".tmp").exists())
-
-    @patch("watchdog.requests.post")
-    def test_login_success_notification_is_separate_and_deduplicated_by_tracker(self, post):
-        post.return_value = Mock(raise_for_status=Mock())
-        environment = {
-            "TELEGRAM_BOT_TOKEN": "token-for-test",
-            "TELEGRAM_CHAT_ID": "123",
-            "TELEGRAM_BOT_API": "http://127.0.0.1:8081",
-        }
-        with patch.dict(os.environ, environment, clear=True):
-            watchdog.send_login_success("manual")
-        self.assertEqual(post.call_count, 1)
-        self.assertIn("登录成功", post.call_args.kwargs["json"]["text"])
-        self.assertNotIn("diagnostic", post.call_args.kwargs["json"])
 
     def test_login_state_marker_is_persisted(self):
         with TemporaryDirectory() as directory:
