@@ -21,6 +21,7 @@ logging.basicConfig(
 )
 LOGGER = logging.getLogger("wechat-session-watchdog")
 OFFLINE_EVENT = threading.Event()
+MANUAL_REARM = threading.Event()
 CONTROL_CHANGED = threading.Event()
 SETTINGS = None
 DEFAULT_SETTINGS = {
@@ -186,8 +187,9 @@ class RecoveryStateStore:
             temporary.unlink(missing_ok=True)
 
 
-def rearm_for_new_event(tracker, triggered):
-    if not triggered or not tracker.paused:
+def rearm_for_new_event(tracker, triggered, manual_rearm=False):
+    """Rearm a paused event tracker only after an explicit user action."""
+    if not triggered or not manual_rearm or not tracker.paused:
         return False
     tracker.reset()
     return True
@@ -473,6 +475,7 @@ class TriggerHandler(BaseHTTPRequestHandler):
             and payload.get("enabled") is True
         ):
             # Re-enabling recovery is the explicit manual rearm.
+            MANUAL_REARM.set()
             OFFLINE_EVENT.set()
         CONTROL_CHANGED.set()
         self._send_json(200, state)
@@ -805,6 +808,9 @@ def main():
         event_enabled = effective_event_enabled(state)
         night_enabled = effective_night_enabled(state)
         triggered = consume_offline_trigger() and event_enabled
+        manual_rearm = MANUAL_REARM.is_set()
+        if triggered and manual_rearm:
+            MANUAL_REARM.clear()
         scheduled = schedule_active(now) and night_enabled
         previous_night_window = night_window
         current_night_window = now.date().isoformat() if scheduled else None
@@ -907,11 +913,13 @@ def main():
             tracker = trackers[recovery_source]
             if (
                 recovery_source == "event"
-                and rearm_for_new_event(tracker, triggered)
-            ):
-                LOGGER.info(
-                    "new offline event rearmed the full event recovery flow"
+                and rearm_for_new_event(
+                    tracker,
+                    triggered,
+                    manual_rearm=manual_rearm,
                 )
+            ):
+                LOGGER.info("manual control rearmed the event recovery flow")
             if tracker.paused:
                 LOGGER.warning(
                     "%s recovery clicks paused after repeated failures",
