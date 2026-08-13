@@ -279,13 +279,32 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(tracker.failures, 0)
         self.assertFalse(tracker.paused)
 
-    def test_new_event_rearms_paused_event_recovery(self):
+    def test_manual_control_rearms_paused_event_recovery(self):
         tracker = watchdog.FailureTracker(limit=1)
         tracker.record_failure()
 
-        self.assertTrue(watchdog.rearm_for_new_event(tracker, triggered=True))
+        self.assertTrue(
+            watchdog.rearm_for_new_event(
+                tracker,
+                triggered=True,
+                manual_rearm=True,
+            )
+        )
         self.assertEqual(tracker.failures, 0)
         self.assertFalse(tracker.paused)
+
+    def test_ordinary_offline_event_does_not_rearm_paused_recovery(self):
+        tracker = watchdog.FailureTracker(limit=1)
+        tracker.record_failure()
+
+        self.assertFalse(
+            watchdog.rearm_for_new_event(
+                tracker,
+                triggered=True,
+                manual_rearm=False,
+            )
+        )
+        self.assertTrue(tracker.paused)
 
     def test_periodic_retry_does_not_rearm_paused_event_recovery(self):
         tracker = watchdog.FailureTracker(limit=1)
