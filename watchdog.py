@@ -367,7 +367,134 @@ def status_snapshot(settings=None) -> dict:
     state = source.snapshot() if source is not None else DEFAULT_SETTINGS.copy()
     state.update(watchdog_runtime_config())
     state["login_event"] = login_event_snapshot()
+    state["connection"] = ConnectionState(connection_state_path()).snapshot()
     return state
+
+
+def connection_state_path() -> Path:
+    return Path(os.getenv("CONNECTION_STATE_PATH", "/state/connection-state.json"))
+
+
+class ConnectionState:
+    """Keep current observations separate from historical login success events."""
+
+    def __init__(self, path):
+        self.path = Path(path)
+        try:
+            value = json.loads(self.path.read_text(encoding="utf-8"))
+            self.data = value if isinstance(value, dict) else {}
+        except (OSError, ValueError):
+            self.data = {}
+
+    def save(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self.path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(self.data, ensure_ascii=True), encoding="utf-8")
+        os.replace(temporary, self.path)
+
+    def observe(self, state, now=None, source=None):
+        now = time.time() if now is None else float(now)
+        previous = self.data.get("state", "unknown")
+        self.data.update(version=1, state=state, checked_at=now)
+        if state in ("offline", "waiting_scan", "manual_attention"):
+            if not self.data.get("offline_since"):
+                self.data["offline_since"] = now
+                self.data["episode_id"] = str(int(now * 1000))
+                self.data["online_duration"] = (
+                    max(0, now - self.data["online_since"])
+                    if self.data.get("online_since") else None
+                )
+        if state == "online":
+            if self.data.get("offline_since"):
+                history = self.data.get("history", [])
+                history.append({
+                    "offline_since": self.data.pop("offline_since"),
+                    "recovered_at": now,
+                    "online_duration": self.data.get("online_duration"),
+                    "source": source or "observed",
+                })
+                self.data["history"] = history[-30:]
+                self.data["online_since"] = now
+            self.data.setdefault("online_since", now)
+            self.data["manual_required"] = False
+        self.save()
+        return previous != state
+
+    def require_manual(self):
+        self.data["manual_required"] = True
+        self.observe("manual_attention")
+
+    def snapshot(self, now=None):
+        now = time.time() if now is None else float(now)
+        result = dict(self.data)
+        result["stale"] = now - float(result.get("checked_at", 0)) > max(
+            300, _env_int("POLL_SECONDS", 120) * 3
+        )
+        return result
+
+
+CONNECTION_LABELS = {
+    "online": "微信已登录，消息接口检查通过",
+    "offline": "微信已退出，正在检查可恢复状态",
+    "waiting_scan": "正在等待扫码，自动点击和重启已暂停",
+    "manual_attention": "需要人工确认登录，自动点击和重启已暂停",
+    "pipeline_unavailable": "微信已登录，但消息接口尚未就绪",
+    "verifying": "正在复核登录和消息接口",
+    "probe_failed": "登录检测失败，暂不能判断是否离线",
+}
+
+
+def update_connection_notice(connection):
+    """Edit one card per observed disconnect; never blindly resend on timeout."""
+    data = connection.data
+    episode = data.get("episode_id")
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    chat_id = os.getenv("TELEGRAM_CHAT_ID")
+    if not episode or not token or not chat_id:
+        return
+    state = data.get("state", "unknown")
+    checked = datetime.fromtimestamp(data["checked_at"], ZoneInfo(os.getenv("TZ", "Asia/Shanghai")))
+    message = (
+        "EFB 微信连接状态\n\n"
+        + CONNECTION_LABELS.get(state, "状态待确认")
+        + f"\n检查时间：{checked:%m-%d %H:%M}"
+    )
+    if state == "online":
+        message += "\n离线期间未接收的消息不能保证补齐；接口恢复不代表已收到新消息。"
+    else:
+        message += "\n队列为空不代表微信正在接收消息。\n未确认离线原因，不自动归因于官方风控。"
+    card = data.get("notice", {})
+    if card.get("episode_id") != episode:
+        card = {"episode_id": episode}
+    if card.get("text") == message or (card.get("attempted") and not card.get("message_id")):
+        return
+    payload = {"chat_id": chat_id, "text": message}
+    if state in ("offline", "waiting_scan", "manual_attention"):
+        payload["reply_markup"] = {"inline_keyboard": [[
+            {"text": "获取登录二维码", "callback_data": "wechat:login"},
+            {"text": "查看状态", "callback_data": "ops:status"},
+        ]]}
+    else:
+        payload["reply_markup"] = {"inline_keyboard": []}
+    method = "editMessageText" if card.get("message_id") else "sendMessage"
+    if card.get("message_id"):
+        payload["message_id"] = card["message_id"]
+    else:
+        # A timeout can occur after Telegram accepted the message.
+        card["attempted"] = True
+        data["notice"] = card
+        connection.save()
+    api = os.getenv("TELEGRAM_BOT_API", "http://127.0.0.1:8081").rstrip("/")
+    response = requests.post(f"{api}/bot{token}/{method}", json=payload, timeout=10)
+    result = response.json()
+    if not result.get("ok"):
+        if "message is not modified" not in str(result.get("description", "")).lower():
+            return
+    elif method == "sendMessage":
+        card["message_id"] = result["result"]["message_id"]
+    card["text"] = message
+    data["notice"] = card
+    connection.save()
 
 
 def offline_event_path() -> Path:
@@ -423,10 +550,8 @@ def check_due(
     seconds_since_check,
     poll_seconds,
 ):
-    return triggered or (
-        (schedule_is_active or recovery_active)
-        and seconds_since_check >= poll_seconds
-    )
+    # Recovery switches gate actions, never read-only login observation.
+    return triggered or seconds_since_check >= poll_seconds
 
 
 def select_recovery_source(current_source, triggered, scheduled):
@@ -780,6 +905,7 @@ def main():
     poll_seconds = int(os.getenv("POLL_SECONDS", "120"))
     cooldown_seconds = click_cooldown_seconds()
     last_check = 0.0
+    last_notice_attempt = 0.0
     last_attempt = 0.0
     failure_limit = int(os.getenv("MAX_RECOVERY_FAILURES", "3"))
     login_tracker = LoginEventTracker()
@@ -787,6 +913,7 @@ def main():
     started_at = time.monotonic()
     SETTINGS = WatchdogSettings(os.getenv("STATE_PATH", "/state/settings.json"))
     recovery_store = RecoveryStateStore(recovery_state_path())
+    connection = ConnectionState(connection_state_path())
     trackers = {
         "event": FailureTracker(failure_limit, cooldown_seconds),
         "night": FailureTracker(failure_limit, cooldown_seconds),
@@ -802,6 +929,12 @@ def main():
     LOGGER.info("watchdog started")
     while True:
         touch_heartbeat()
+        if last_check and time.monotonic() - last_notice_attempt >= 60:
+            last_notice_attempt = time.monotonic()
+            try:
+                update_connection_notice(connection)
+            except (requests.RequestException, OSError, ValueError, KeyError):
+                LOGGER.warning("connection notice unavailable; observation continues")
         now = datetime.now(timezone)
         monotonic_now = time.monotonic()
         state = SETTINGS.snapshot()
@@ -837,20 +970,6 @@ def main():
         )
         if previous_source != recovery_source:
             persist_recovery_state()
-        if recovery_source is not None and manual_login_session_active():
-            LOGGER.info(
-                "manual QR login session is active; automatic clicks and "
-                "stack recovery are deferred"
-            )
-            OFFLINE_EVENT.wait(timeout=5)
-            continue
-        if recovery_source is not None and startup_grace_active(
-            started_at,
-            monotonic_now,
-        ):
-            LOGGER.info("watchdog startup grace is active; recovery is deferred")
-            OFFLINE_EVENT.wait(timeout=5)
-            continue
         if not check_due(
             triggered,
             scheduled,
@@ -864,6 +983,16 @@ def main():
 
         try:
             logged_in = is_logged_in()
+            if logged_in:
+                bridge = bridge_state()
+                if not (
+                    bridge.get("ok") is True
+                    and bridge.get("hooks_ready") is True
+                    and bridge.get("is_login") is True
+                ):
+                    connection.observe("pipeline_unavailable")
+                    login_tracker.observe("unknown", time.time())
+                    continue
             if logged_in and login_tracker.state != "logged_in":
                 logged_in = confirm_operational_login()
                 if not logged_in:
@@ -872,23 +1001,11 @@ def main():
                         "success notification suppressed"
                     )
                     login_tracker.observe("unknown", time.time())
-                    if recovery_source is not None:
-                        request_stack_recovery()
-                        tracker = trackers[recovery_source]
-                        previous_tracker_state = tracker.snapshot()
-                        should_alert = tracker.record_failure(now=monotonic_now)
-                        if tracker.snapshot() != previous_tracker_state:
-                            persist_recovery_state()
-                        if should_alert:
-                            send_alert(
-                                f"EFB 微信{RECOVERY_LABELS[recovery_source]}恢复连续失败 "
-                                f"{tracker.limit} 次，本次自动恢复已停止。"
-                                "登录接口或消息 Hook 未能持续稳定，请使用 /login "
-                                "重新扫码；无需在 NAS 旁操作。"
-                            )
+                    connection.observe("verifying")
                     OFFLINE_EVENT.wait(timeout=5)
                     continue
             if logged_in:
+                connection.observe("online")
                 LOGGER.info("wechat is logged in")
                 last_attempt = 0.0
                 if not login_probe_initialized:
@@ -910,6 +1027,24 @@ def main():
             login_probe_initialized = True
             login_tracker.observe("offline", time.time())
             LOGGER.warning("wechat is offline")
+            manual_session = manual_login_session_active()
+            connection.observe(
+                "waiting_scan" if manual_session else (
+                    "manual_attention" if connection.data.get("manual_required") else "offline"
+                )
+            )
+            if manual_session or startup_grace_active(started_at, monotonic_now):
+                continue
+            if connection.data.get("manual_required"):
+                if not (triggered and manual_rearm):
+                    continue
+                connection.data["manual_required"] = False
+                connection.save()
+            if recovery_source is None and event_enabled:
+                recovery_source = "event"
+                persist_recovery_state()
+            if recovery_source is None:
+                continue
             tracker = trackers[recovery_source]
             if (
                 recovery_source == "event"
@@ -930,12 +1065,15 @@ def main():
                 LOGGER.info("click attempt is cooling down")
                 continue
             restored = False
-            if capture_and_click():
-                last_attempt = monotonic_now
+            last_attempt = monotonic_now
+            clicked = capture_and_click()
+            if clicked:
+                connection.observe("verifying")
                 time.sleep(30)
                 restored = confirm_operational_login()
                 LOGGER.info("login restored=%s", restored)
                 if restored:
+                    connection.observe("online", source="automatic")
                     recovered_source = recovery_source
                     if login_tracker.automatic_success(time.time()):
                         mark_login_event("automatic")
@@ -949,19 +1087,28 @@ def main():
                     vnc_command("capture", diagnostic_path())
                     LOGGER.info("latest failed-login diagnostic saved")
             if not restored:
-                request_stack_recovery()
+                # No actionable button is not evidence of a crashed process.
+                # Preserve the existing client/session and wait for manual login.
+                if not clicked:
+                    connection.require_manual()
+                    continue
                 previous_tracker_state = tracker.snapshot()
                 should_alert = tracker.record_failure(now=monotonic_now)
                 if tracker.snapshot() != previous_tracker_state:
                     persist_recovery_state()
                 if should_alert:
+                    connection.require_manual()
                     send_alert(
                         f"EFB 微信{RECOVERY_LABELS[recovery_source]}恢复连续失败 "
                         f"{tracker.limit} 次，本次自动恢复已停止，不会继续重试。"
                         "请查看 watchdog 最新诊断画面并人工确认登录状态。"
                     )
         except Exception as error:
-            LOGGER.warning("watchdog check failed: %s", error)
+            try:
+                connection.observe("probe_failed")
+            except OSError:
+                LOGGER.warning("unable to persist login observation")
+            LOGGER.warning("watchdog check failed: %s", type(error).__name__)
 
 
 if __name__ == "__main__":
