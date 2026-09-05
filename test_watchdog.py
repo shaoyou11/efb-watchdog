@@ -39,8 +39,9 @@ class ScheduleTests(unittest.TestCase):
     def test_event_recovery_retries_outside_daily_window(self):
         self.assertTrue(watchdog.check_due(False, False, True, 120, 120))
 
-    def test_periodic_poll_is_blocked_outside_daily_window(self):
-        self.assertFalse(watchdog.check_due(False, False, False, 120, 120))
+    def test_readonly_poll_continues_outside_daily_window(self):
+        self.assertTrue(watchdog.check_due(False, False, False, 120, 120))
+        self.assertFalse(watchdog.check_due(False, False, False, 119, 120))
 
     def test_event_recovery_supersedes_night_recovery(self):
         self.assertEqual(
@@ -422,6 +423,79 @@ class RecoveryTests(unittest.TestCase):
             payload = json.loads(target.read_text(encoding="utf-8"))
         self.assertEqual(payload["source"], "manual")
         self.assertEqual(payload["state"], "logged_in")
+
+
+class ConnectionStateTests(unittest.TestCase):
+    def test_disconnect_history_survives_restart_and_unknown_probe(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "connection.json"
+            state = watchdog.ConnectionState(path)
+            state.observe("online", now=100)
+            state.observe("offline", now=200)
+            state.require_manual()
+            state = watchdog.ConnectionState(path)
+            self.assertTrue(state.data["manual_required"])
+            state.observe("probe_failed", now=250)
+            self.assertEqual(state.data["offline_since"], 200)
+            state.observe("online", now=300, source="automatic")
+            self.assertFalse(state.data["manual_required"])
+            self.assertNotIn("offline_since", state.data)
+            self.assertEqual(state.data["history"][0]["source"], "automatic")
+            self.assertEqual(state.data["history"][0]["online_duration"], 100)
+            self.assertTrue(state.snapshot(now=1000)["stale"])
+
+    def test_notice_edits_same_card_and_does_not_repeat_uncertain_send(self):
+        with TemporaryDirectory() as directory, patch.dict(os.environ, {
+            "TELEGRAM_BOT_TOKEN": "test-token", "TELEGRAM_CHAT_ID": "1",
+        }, clear=True):
+            state = watchdog.ConnectionState(Path(directory) / "connection.json")
+            state.observe("offline", now=200)
+            response = Mock()
+            response.json.return_value = {"ok": True, "result": {"message_id": 7}}
+            with patch.object(watchdog.requests, "post", return_value=response) as post:
+                watchdog.update_connection_notice(state)
+                watchdog.update_connection_notice(state)
+                self.assertEqual(post.call_count, 1)
+                state.observe("online", now=300)
+                watchdog.update_connection_notice(state)
+                self.assertTrue(post.call_args.args[0].endswith("/editMessageText"))
+                self.assertEqual(post.call_args.kwargs["json"]["message_id"], 7)
+            state.observe("offline", now=400)
+            with patch.object(watchdog.requests, "post", side_effect=watchdog.requests.Timeout) as post:
+                with self.assertRaises(watchdog.requests.Timeout):
+                    watchdog.update_connection_notice(state)
+                watchdog.update_connection_notice(watchdog.ConnectionState(state.path))
+                self.assertEqual(post.call_count, 1)
+
+    def test_no_actionable_login_does_not_restart_wechat(self):
+        from contextlib import ExitStack
+        from itertools import count
+        with TemporaryDirectory() as directory, ExitStack() as stack:
+            stack.enter_context(patch.dict(os.environ, {
+                "STATE_PATH": str(Path(directory) / "settings.json"),
+                "RECOVERY_STATE_PATH": str(Path(directory) / "recovery.json"),
+                "CONNECTION_STATE_PATH": str(Path(directory) / "connection.json"),
+            }, clear=True))
+            replacements = {
+                "touch_heartbeat": Mock(side_effect=[None, None, KeyboardInterrupt]),
+                "start_trigger_server": Mock(),
+                "consume_offline_trigger": Mock(return_value=False),
+                "manual_login_session_active": Mock(return_value=False),
+                "startup_grace_active": Mock(return_value=False),
+                "is_logged_in": Mock(return_value=False),
+                "capture_and_click": Mock(return_value=False),
+                "request_stack_recovery": Mock(),
+                "update_connection_notice": Mock(),
+            }
+            for name, mock in replacements.items():
+                stack.enter_context(patch.object(watchdog, name, mock))
+            stack.enter_context(patch.object(watchdog.time, "monotonic", side_effect=count(1000, 120).__next__))
+            stack.enter_context(patch.object(watchdog.OFFLINE_EVENT, "wait"))
+            with self.assertRaises(KeyboardInterrupt):
+                watchdog.main()
+            self.assertEqual(replacements["is_logged_in"].call_count, 2)
+            self.assertEqual(replacements["capture_and_click"].call_count, 1)
+            replacements["request_stack_recovery"].assert_not_called()
 
 
 if __name__ == "__main__":
