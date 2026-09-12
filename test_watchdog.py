@@ -467,6 +467,51 @@ class ConnectionStateTests(unittest.TestCase):
                 watchdog.update_connection_notice(watchdog.ConnectionState(state.path))
                 self.assertEqual(post.call_count, 1)
 
+    def test_manual_qr_lease_blocks_probes_until_released(self):
+        from contextlib import ExitStack
+        from itertools import count
+        with TemporaryDirectory() as directory, ExitStack() as stack:
+            stack.enter_context(patch.dict(os.environ, {
+                "STATE_PATH": str(Path(directory) / "settings.json"),
+                "RECOVERY_STATE_PATH": str(Path(directory) / "recovery.json"),
+                "CONNECTION_STATE_PATH": str(Path(directory) / "connection.json"),
+            }, clear=True))
+            probes = []
+            def probe():
+                probes.append("probe")
+                return True
+            def lease():
+                # The first two iterations are owned by manual login.
+                active = lease.calls < 2
+                lease.calls += 1
+                if active:
+                    self.assertEqual(probes, [])
+                return active
+            lease.calls = 0
+            replacements = {
+                "touch_heartbeat": Mock(side_effect=[None, None, None, KeyboardInterrupt]),
+                "start_trigger_server": Mock(),
+                "consume_offline_trigger": Mock(return_value=False),
+                "manual_login_session_active": Mock(side_effect=lease),
+                "is_logged_in": Mock(side_effect=probe),
+                "bridge_state": Mock(return_value={"ok": True, "hooks_ready": True, "is_login": True}),
+                "confirm_operational_login": Mock(return_value=True),
+                "capture_and_click": Mock(),
+                "request_stack_recovery": Mock(),
+                "update_connection_notice": Mock(),
+                "clear_diagnostic": Mock(),
+            }
+            for name, mock in replacements.items():
+                stack.enter_context(patch.object(watchdog, name, mock))
+            stack.enter_context(patch.object(watchdog.time, "monotonic", side_effect=count(1000, 120).__next__))
+            stack.enter_context(patch.object(watchdog.OFFLINE_EVENT, "wait"))
+            with self.assertRaises(KeyboardInterrupt):
+                watchdog.main()
+            self.assertEqual(probes, ["probe"])
+            replacements["capture_and_click"].assert_not_called()
+            replacements["request_stack_recovery"].assert_not_called()
+            self.assertEqual(json.loads((Path(directory) / "connection.json").read_text())["state"], "online")
+
     def test_no_actionable_login_does_not_restart_wechat(self):
         from contextlib import ExitStack
         from itertools import count

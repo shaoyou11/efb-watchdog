@@ -970,6 +970,12 @@ def main():
         )
         if previous_source != recovery_source:
             persist_recovery_state()
+        # Manual QR login owns the client until EFB confirms it or the lease expires.
+        # Observe the local lease before any COM/login probe, not just before clicks.
+        if manual_login_session_active():
+            connection.observe("waiting_scan")
+            OFFLINE_EVENT.wait(timeout=5)
+            continue
         if not check_due(
             triggered,
             scheduled,
