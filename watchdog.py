@@ -329,6 +329,40 @@ def request_stack_recovery() -> bool:
         return False
 
 
+def recover_offline_episode_once(connection) -> bool:
+    """Replace a failed old session once; ambiguous probes never permit recovery."""
+    if connection.data.get("offline_recovery_attempt") or not connection.data.get("online_since"):
+        return False
+    generation = None
+    try:
+        for index in range(3):
+            if manual_login_session_active() or is_logged_in():
+                return False
+            state = bridge_state()
+            current = str(state.get("stack_generation", "")).strip()
+            if (state.get("ok") is not True or state.get("hooks_ready") is not True
+                    or state.get("is_login") is not False or not current):
+                return False
+            if generation is not None and current != generation:
+                return False
+            generation = current
+            if index < 2:
+                time.sleep(1)
+        if manual_login_session_active():
+            return False
+    except (requests.RequestException, ValueError, TypeError):
+        LOGGER.warning("offline recovery deferred: login state could not be confirmed")
+        return False
+    # Save before POST: even a timeout may mean the supervisor accepted it.
+    connection.data["offline_recovery_attempt"] = {
+        "at": time.time(), "stack_generation": generation,
+    }
+    connection.require_manual()
+    accepted = request_stack_recovery()
+    LOGGER.info("one recovery attempt for confirmed offline episode: accepted=%s", accepted)
+    return accepted
+
+
 def click_cooldown_seconds() -> int:
     return int(os.getenv("CLICK_COOLDOWN_SECONDS", "120"))
 
@@ -417,6 +451,7 @@ class ConnectionState:
                 self.data["online_since"] = now
             self.data.setdefault("online_since", now)
             self.data["manual_required"] = False
+            self.data.pop("offline_recovery_attempt", None)
         self.save()
         return previous != state
 
@@ -1093,10 +1128,11 @@ def main():
                     vnc_command("capture", diagnostic_path())
                     LOGGER.info("latest failed-login diagnostic saved")
             if not restored:
-                # No actionable button is not evidence of a crashed process.
-                # Preserve the existing client/session and wait for manual login.
+                # A failed old session may remain alive after logout. Replace it
+                # at most once, only while the same stack is confirmed offline.
+                recover_offline_episode_once(connection)
+                connection.require_manual()
                 if not clicked:
-                    connection.require_manual()
                     continue
                 previous_tracker_state = tracker.snapshot()
                 should_alert = tracker.record_failure(now=monotonic_now)
