@@ -543,5 +543,63 @@ class ConnectionStateTests(unittest.TestCase):
             replacements["request_stack_recovery"].assert_not_called()
 
 
+class BoundedOfflineRecoveryTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.state = watchdog.ConnectionState(Path(self.directory.name) / "connection.json")
+        self.state.observe("online", now=100)
+        self.state.observe("offline", now=200)
+        self.ready = {"ok": True, "hooks_ready": True, "is_login": False, "stack_generation": "one"}
+
+    def attempt(self, manual=False, login=False, states=None):
+        from contextlib import ExitStack
+        with ExitStack() as stack:
+            lease = stack.enter_context(patch.object(watchdog, "manual_login_session_active", return_value=manual))
+            stack.enter_context(patch.object(watchdog, "is_logged_in", return_value=login))
+            bridge = stack.enter_context(patch.object(watchdog, "bridge_state", return_value=self.ready))
+            if states is not None:
+                bridge.side_effect = states
+            post = stack.enter_context(patch.object(watchdog, "request_stack_recovery", return_value=False))
+            stack.enter_context(patch.object(watchdog.time, "sleep"))
+            watchdog.recover_offline_episode_once(self.state)
+            return post.call_count
+
+    def test_failed_request_is_not_repeated_even_after_restart(self):
+        self.assertEqual(self.attempt(), 1)
+        self.state = watchdog.ConnectionState(self.state.path)
+        self.assertTrue(self.state.data["manual_required"])
+        self.assertEqual(self.attempt(), 0)
+
+    def test_confirmed_new_login_allows_one_recovery_in_next_episode(self):
+        self.assertEqual(self.attempt(), 1)
+        self.state.observe("online", now=300)
+        self.state.observe("offline", now=400)
+        self.assertEqual(self.attempt(), 1)
+        self.assertEqual(self.attempt(), 0)
+
+    def test_manual_scan_and_logged_in_client_never_restart(self):
+        self.assertEqual(self.attempt(manual=True), 0)
+        self.assertEqual(self.attempt(login=True), 0)
+        self.assertNotIn("offline_recovery_attempt", self.state.data)
+
+    def test_unknown_or_changed_stack_never_restarts(self):
+        self.assertEqual(self.attempt(states=[{}]), 0)
+        self.assertEqual(self.attempt(states=[watchdog.requests.Timeout()]), 0)
+        changed = dict(self.ready, stack_generation="two")
+        self.assertEqual(self.attempt(states=[self.ready, changed]), 0)
+        self.assertNotIn("offline_recovery_attempt", self.state.data)
+
+    def test_never_logged_in_session_is_not_restarted(self):
+        self.state.data.pop("online_since")
+        self.assertEqual(self.attempt(), 0)
+
+    def test_scan_started_during_confirmation_cancels_recovery(self):
+        with patch.object(watchdog, "manual_login_session_active", side_effect=[False, False, True]), patch.object(watchdog, "is_logged_in", return_value=False), patch.object(watchdog, "bridge_state", return_value=self.ready), patch.object(watchdog.time, "sleep"), patch.object(watchdog, "request_stack_recovery") as post:
+            watchdog.recover_offline_episode_once(self.state)
+            post.assert_not_called()
+        self.assertNotIn("offline_recovery_attempt", self.state.data)
+
+
 if __name__ == "__main__":
     unittest.main()
