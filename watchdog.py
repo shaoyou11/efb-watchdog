@@ -311,21 +311,23 @@ def confirm_operational_login(probes=None, interval_seconds=None) -> bool:
     return True
 
 
-def request_stack_recovery() -> bool:
+def request_stack_recovery(request_id, stack_generation) -> bool:
+    url = os.getenv("WECHAT_SUPERVISOR_RECOVER_URL", "http://127.0.0.1:19089/recover")
     try:
-        response = requests.post(
-            os.getenv(
-                "WECHAT_SUPERVISOR_RECOVER_URL",
-                "http://127.0.0.1:19089/recover",
-            ),
-            data=b"{}",
-            timeout=5,
-        )
+        status = requests.get(url.rsplit("/", 1)[0] + "/healthz", timeout=5)
+        status.raise_for_status()
+        state = status.json()
+        if state.get("recovery_protocol") != 1 or state.get("state") != "running":
+            LOGGER.warning("bounded recovery unavailable; no legacy restart requested")
+            return False
+        response = requests.post(url, json={
+            "source": "automatic", "request_id": request_id,
+            "stack_generation": stack_generation,
+        }, timeout=5)
         response.raise_for_status()
-        LOGGER.warning("requested one bounded ComWechat stack recovery")
-        return True
-    except requests.RequestException as error:
-        LOGGER.warning("unable to request ComWechat stack recovery: %s", error)
+        return response.json().get("accepted") is True
+    except (requests.RequestException, ValueError, TypeError):
+        LOGGER.warning("bounded recovery request not confirmed; no retry")
         return False
 
 
@@ -358,7 +360,9 @@ def recover_offline_episode_once(connection) -> bool:
         "at": time.time(), "stack_generation": generation,
     }
     connection.require_manual()
-    accepted = request_stack_recovery()
+    accepted = request_stack_recovery(
+        "offline-" + str(connection.data.get("episode_id")), generation
+    )
     LOGGER.info("one recovery attempt for confirmed offline episode: accepted=%s", accepted)
     return accepted
 
