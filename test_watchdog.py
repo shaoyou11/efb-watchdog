@@ -218,13 +218,21 @@ class RecoveryTests(unittest.TestCase):
         ):
             self.assertEqual(watchdog.operational_login_probe(), (False, "stack-a"))
 
+    @patch("watchdog.requests.get")
     @patch("watchdog.requests.post")
-    def test_stack_recovery_request_is_bounded_and_local(self, post):
-        post.return_value.raise_for_status.return_value = None
-
-        self.assertTrue(watchdog.request_stack_recovery())
+    def test_stack_recovery_request_is_bounded_and_local(self, post, get):
+        get.return_value.json.return_value = {"state": "running", "recovery_protocol": 1}
+        post.return_value.json.return_value = {"accepted": True}
+        self.assertTrue(watchdog.request_stack_recovery("episode", "stack"))
         self.assertEqual(post.call_count, 1)
-        self.assertEqual(post.call_args.args[0], "http://127.0.0.1:19089/recover")
+        self.assertEqual(post.call_args.kwargs["json"], {
+            "source": "automatic", "request_id": "episode", "stack_generation": "stack",
+        })
+        get.return_value.json.return_value = {"state": "running"}
+        self.assertFalse(watchdog.request_stack_recovery("episode2", "stack"))
+        get.return_value.json.return_value = {"state": "paused", "recovery_protocol": 1}
+        self.assertFalse(watchdog.request_stack_recovery("episode3", "stack"))
+        self.assertEqual(post.call_count, 1)
 
     @patch("watchdog.time.sleep")
     def test_login_success_requires_consecutive_probes(self, sleep):
